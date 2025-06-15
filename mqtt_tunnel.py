@@ -36,7 +36,9 @@ class MQTTTunnel:
 
     def _setup_logging(self):
         level = logging.DEBUG if self.debug else logging.INFO
-        logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=level)
+        logging.basicConfig(
+            format="%(asctime)s - %(levelname)s - %(name)s - %(message)s", level=level
+        )
         self.log = logging.getLogger("MQTTTunnel")
 
         # MQTT client logging
@@ -55,22 +57,28 @@ class MQTTTunnel:
             raise
 
     def create_mqtt_client(self, client_id: Optional[str] = None) -> mqtt.Client:
+        client_id = client_id or f"mqtttunnel_{uuid.uuid4().hex[:8]}"
         client = mqtt.Client(client_id=client_id, clean_session=True)
-        if "username" in self.profile and "password" in self.profile:
-            username = self.profile["username"].strip() or None
-            password = self.profile["password"].strip() or None
+
+        # Set credentials if available
+        username = self.profile.get("username", "").strip() or None
+        password = self.profile.get("password", "").strip() or None
+        if username and password:
             client.username_pw_set(username, password)
 
         # Enable TLS if configured
         if self.profile.get("tls", False):
             import ssl
 
-            tls_version = {
+            tls_version_map = {
                 "tlsv1": ssl.PROTOCOL_TLSv1,
                 "tlsv1.1": ssl.PROTOCOL_TLSv1_1,
                 "tlsv1.2": ssl.PROTOCOL_TLSv1_2,
                 "tls": ssl.PROTOCOL_TLS,
-            }.get(self.profile.get("tls_version", "tls"), ssl.PROTOCOL_TLS)
+            }
+            tls_version = tls_version_map.get(
+                self.profile.get("tls_version", "tlsv1.2"), ssl.PROTOCOL_TLS
+            )
 
             client.tls_set(
                 ca_certs=self.profile.get("ca_cert"),
@@ -87,7 +95,7 @@ class MQTTTunnel:
         return client
 
     def setup_control_channel(self):
-        self.control_client = self.create_mqtt_client(client_id=f"control_{uuid.uuid4().hex[:8]}")
+        self.control_client = self.create_mqtt_client()
         control_topic = f"{self.topic_prefix}/control"
 
         def on_connect(client, userdata, flags, rc):
@@ -107,11 +115,16 @@ class MQTTTunnel:
             except Exception as e:
                 self.log.error(f"Invalid control message: {str(e)}")
 
+        def on_disconnect(client, userdata, rc):
+            if rc != 0 and not self.shutdown_event.is_set():
+                self.log.error(
+                    f"Control channel disconnected unexpectedly: {mqtt.error_string(rc)}"
+                )
+                self.shutdown_event.set()
+
         self.control_client.on_connect = on_connect
         self.control_client.on_message = on_message
-        self.control_client.on_disconnect = lambda c, u, rc: self.log.warning(
-            f"Control channel disconnected: {mqtt.error_string(rc)}"
-        )
+        self.control_client.on_disconnect = on_disconnect
 
         try:
             self.control_client.connect(
@@ -140,6 +153,7 @@ class MQTTTunnel:
                                 target=self.handle_server_connection,
                                 args=(conn_id, service_host, service_port),
                                 daemon=True,
+                                name=f"svr-conn-{conn_id[:8]}",
                             ).start()
                         else:
                             self.log.error(f"Max connections reached, rejecting {conn_id}")
@@ -152,11 +166,12 @@ class MQTTTunnel:
                 except queue.Empty:
                     continue
 
-        threading.Thread(target=control_handler, daemon=True).start()
+        threading.Thread(target=control_handler, daemon=True, name="ctrl-handler").start()
 
         # Wait for shutdown signal
         signal.signal(signal.SIGINT, self.signal_handler)
         signal.signal(signal.SIGTERM, self.signal_handler)
+        self.log.info("Server ready. Press Ctrl+C to exit.")
         self.shutdown_event.wait()
         self.cleanup()
 
@@ -170,9 +185,7 @@ class MQTTTunnel:
         server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server_sock.bind((local_host, local_port))
         server_sock.listen(5)
-
-        # Make socket non-blocking
-        server_sock.settimeout(1)
+        server_sock.settimeout(1)  # Make socket non-blocking with timeout
 
         def accept_connections():
             while not self.shutdown_event.is_set():
@@ -184,25 +197,28 @@ class MQTTTunnel:
                         target=self.handle_client_connection,
                         args=(conn_id, client_sock),
                         daemon=True,
+                        name=f"cli-conn-{conn_id[:8]}",
                     ).start()
                 except socket.timeout:
                     continue
                 except OSError as e:
                     if not self.shutdown_event.is_set():
                         self.log.error(f"Accept error: {str(e)}")
+            server_sock.close()
 
-        threading.Thread(target=accept_connections, daemon=True).start()
+        threading.Thread(target=accept_connections, daemon=True, name="accept-thread").start()
 
         # Wait for shutdown signal
         signal.signal(signal.SIGINT, self.signal_handler)
         signal.signal(signal.SIGTERM, self.signal_handler)
+        self.log.info("Client ready. Press Ctrl+C to exit.")
         self.shutdown_event.wait()
-        server_sock.close()
         self.cleanup()
 
     def handle_server_connection(self, conn_id: str, service_host: str, service_port: int):
         """Server-side connection handler"""
         service_sock = None
+        mqtt_client = None
         try:
             # Connect to local service with timeout
             service_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -223,7 +239,7 @@ class MQTTTunnel:
             self.send_control_message("service_ready", conn_id)
 
             # Create MQTT client for this connection
-            mqtt_client = self.create_mqtt_client(client_id=f"srv_{conn_id[:8]}")
+            mqtt_client = self.create_mqtt_client()
             mqtt_client.connect(self.profile["host"], int(self.profile["port"]), self.keepalive)
             mqtt_client.loop_start()
 
@@ -241,7 +257,7 @@ class MQTTTunnel:
 
             def mqtt_to_service():
                 def on_message(client, userdata, msg):
-                    if msg.topic == outbound_topic:
+                    if msg.topic == outbound_topic and not self.shutdown_event.is_set():
                         try:
                             self.log.debug(f"MQTT->SERVICE: {len(msg.payload)} bytes")
                             service_sock.sendall(msg.payload)
@@ -254,15 +270,11 @@ class MQTTTunnel:
 
                 mqtt_client.on_message = on_message
 
-                while not self.shutdown_event.is_set():
-                    if conn_id not in self.connections:
-                        break
+                while not self.shutdown_event.is_set() and conn_id in self.connections:
                     time.sleep(0.1)
 
             def service_to_mqtt():
-                while not self.shutdown_event.is_set():
-                    if conn_id not in self.connections:
-                        break
+                while not self.shutdown_event.is_set() and conn_id in self.connections:
                     try:
                         data = service_sock.recv(4096)
                         if not data:
@@ -280,16 +292,21 @@ class MQTTTunnel:
                     except BlockingIOError:
                         time.sleep(0.01)
                     except Exception as e:
-                        self.log.error(f"Unexpected error: {str(e)}")
+                        if not self.shutdown_event.is_set():
+                            self.log.error(f"Unexpected error: {str(e)}")
                         self.close_connection(conn_id)
                         break
 
             # Start data handlers
-            threading.Thread(target=mqtt_to_service, daemon=True).start()
-            threading.Thread(target=service_to_mqtt, daemon=True).start()
+            threading.Thread(
+                target=mqtt_to_service, daemon=True, name=f"mqtt2svc-{conn_id[:8]}"
+            ).start()
+            threading.Thread(
+                target=service_to_mqtt, daemon=True, name=f"svc2mqtt-{conn_id[:8]}"
+            ).start()
 
             # Monitor connection health
-            while conn_id in self.connections:
+            while conn_id in self.connections and not self.shutdown_event.is_set():
                 # Check if service socket is still connected
                 try:
                     # Test if socket is still alive
@@ -299,7 +316,8 @@ class MQTTTunnel:
                     self.close_connection(conn_id)
                     break
                 except Exception as e:
-                    self.log.error(f"Connection health check failed: {str(e)}")
+                    if not self.shutdown_event.is_set():
+                        self.log.error(f"Connection health check failed: {str(e)}")
                     self.close_connection(conn_id)
                     break
 
@@ -309,18 +327,25 @@ class MQTTTunnel:
             self.log.error(f"Server connection setup failed: {str(e)}")
             if service_sock:
                 service_sock.close()
+            if mqtt_client:
+                try:
+                    mqtt_client.loop_stop()
+                    mqtt_client.disconnect()
+                except:
+                    pass
             self.send_control_message("disconnect", conn_id)
         finally:
             self.active_connections.release()
 
     def handle_client_connection(self, conn_id: str, client_sock: socket.socket):
         """Client-side connection handler"""
+        mqtt_client = None
         try:
             # Set socket timeout for disconnect detection
             client_sock.settimeout(5)
 
             # Create MQTT client for this connection
-            mqtt_client = self.create_mqtt_client(client_id=f"cli_{conn_id[:8]}")
+            mqtt_client = self.create_mqtt_client()
             mqtt_client.connect(self.profile["host"], int(self.profile["port"]), self.keepalive)
             mqtt_client.loop_start()
 
@@ -362,11 +387,17 @@ class MQTTTunnel:
                         elif msg.get("action") == "service_error" and msg["conn_id"] == conn_id:
                             self.log.error("Service connection error on server side")
                             service_failed.set()
+                        elif msg.get("action") == "reject" and msg["conn_id"] == conn_id:
+                            self.log.error("Connection rejected by server")
+                            service_failed.set()
                     except queue.Empty:
                         continue
 
             # Start temporary control handler
-            threading.Thread(target=control_handler, daemon=True).start()
+            ctrl_thread = threading.Thread(
+                target=control_handler, daemon=True, name=f"ctrl-{conn_id[:8]}"
+            )
+            ctrl_thread.start()
 
             # Wait for service to be ready or failed
             start_time = time.time()
@@ -385,7 +416,7 @@ class MQTTTunnel:
 
             def mqtt_to_client():
                 def on_message(client, userdata, msg):
-                    if msg.topic == inbound_topic:
+                    if msg.topic == inbound_topic and not self.shutdown_event.is_set():
                         try:
                             self.log.debug(f"MQTT->CLIENT: {len(msg.payload)} bytes")
                             client_sock.sendall(msg.payload)
@@ -398,15 +429,11 @@ class MQTTTunnel:
 
                 mqtt_client.on_message = on_message
 
-                while not self.shutdown_event.is_set():
-                    if conn_id not in self.connections:
-                        break
+                while not self.shutdown_event.is_set() and conn_id in self.connections:
                     time.sleep(0.1)
 
             def client_to_mqtt():
-                while not self.shutdown_event.is_set():
-                    if conn_id not in self.connections:
-                        break
+                while not self.shutdown_event.is_set() and conn_id in self.connections:
                     try:
                         data = client_sock.recv(4096)
                         if not data:
@@ -424,16 +451,21 @@ class MQTTTunnel:
                     except BlockingIOError:
                         time.sleep(0.01)
                     except Exception as e:
-                        self.log.error(f"Unexpected error: {str(e)}")
+                        if not self.shutdown_event.is_set():
+                            self.log.error(f"Unexpected error: {str(e)}")
                         self.close_connection(conn_id)
                         break
 
             # Start data handlers
-            threading.Thread(target=mqtt_to_client, daemon=True).start()
-            threading.Thread(target=client_to_mqtt, daemon=True).start()
+            threading.Thread(
+                target=mqtt_to_client, daemon=True, name=f"mqtt2cli-{conn_id[:8]}"
+            ).start()
+            threading.Thread(
+                target=client_to_mqtt, daemon=True, name=f"cli2mqtt-{conn_id[:8]}"
+            ).start()
 
             # Monitor connection health
-            while conn_id in self.connections:
+            while conn_id in self.connections and not self.shutdown_event.is_set():
                 # Check if client socket is still connected
                 try:
                     # Test if socket is still alive
@@ -443,7 +475,8 @@ class MQTTTunnel:
                     self.close_connection(conn_id)
                     break
                 except Exception as e:
-                    self.log.error(f"Connection health check failed: {str(e)}")
+                    if not self.shutdown_event.is_set():
+                        self.log.error(f"Connection health check failed: {str(e)}")
                     self.close_connection(conn_id)
                     break
 
@@ -451,34 +484,48 @@ class MQTTTunnel:
 
         except Exception as e:
             self.log.error(f"Client connection setup failed: {str(e)}")
-            client_sock.close()
+            if client_sock:
+                client_sock.close()
+            if mqtt_client:
+                try:
+                    mqtt_client.loop_stop()
+                    mqtt_client.disconnect()
+                except:
+                    pass
             self.send_control_message("disconnect", conn_id)
 
     def send_control_message(self, action: str, conn_id: str):
         payload = json.dumps({"action": action, "conn_id": conn_id, "timestamp": time.time()})
-        result = self.control_client.publish(f"{self.topic_prefix}/control", payload, qos=1)
+        topic = f"{self.topic_prefix}/control"
+        result = self.control_client.publish(topic, payload, qos=1)
         if self.debug:
-            result.wait_for_publish()
-            self.log.debug(f"Sent control message: {action} for {conn_id}")
+            try:
+                result.wait_for_publish(timeout=1)
+            except:
+                pass
+            self.log.debug(f"Sent control: {action} for {conn_id}")
 
     def close_connection(self, conn_id: str, notify: bool = True):
         if conn_id in self.connections:
             self.log.info(f"Closing connection: {conn_id}")
             sock, mqtt_client = self.connections[conn_id]
             try:
+                # Stop MQTT client properly
+                mqtt_client.loop_stop()
+                mqtt_client.disconnect()
+            except Exception as e:
+                self.log.warning(f"MQTT cleanup error: {str(e)}")
+            try:
                 sock.close()
             except Exception as e:
                 self.log.warning(f"Socket close error: {str(e)}")
-            try:
-                mqtt_client.disconnect()
-            except Exception as e:
-                self.log.warning(f"MQTT disconnect error: {str(e)}")
             del self.connections[conn_id]
             if notify:
                 self.send_control_message("disconnect", conn_id)
 
     def signal_handler(self, signum, frame):
-        self.log.info(f"Received signal {signum}, shutting down...")
+        signame = signal.Signals(signum).name
+        self.log.info(f"Received {signame}, shutting down...")
         self.shutdown_event.set()
 
     def cleanup(self):
@@ -488,15 +535,20 @@ class MQTTTunnel:
             self.close_connection(conn_id, notify=False)
 
         # Clean up control client
-        try:
-            self.control_client.disconnect()
-        except:
-            pass
+        if hasattr(self, "control_client"):
+            try:
+                self.control_client.loop_stop()
+                self.control_client.disconnect()
+            except:
+                pass
         self.log.info("Cleanup complete")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="MQTT Tunnel")
+    parser = argparse.ArgumentParser(
+        description="MQTT Tunnel - Secure network tunneling over MQTT",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     parser.add_argument("mode", choices=["server", "client"], help="Operation mode")
     parser.add_argument("profiles_file", help="Profiles JSON file")
     parser.add_argument("profile_name", help="Profile to use")
@@ -506,24 +558,22 @@ def main():
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
 
     # Server mode arguments
-    parser.add_argument("--service-host", default="localhost", help="Service host (server mode)")
-    parser.add_argument(
-        "--service-port",
-        type=int,
-        required=("server" in sys.argv),
-        help="Service port (server mode)",
-    )
+    server_group = parser.add_argument_group("Server mode arguments")
+    server_group.add_argument("--service-host", default="localhost", help="Service host")
+    server_group.add_argument("--service-port", type=int, help="Service port")
 
     # Client mode arguments
-    parser.add_argument("--local-host", default="localhost", help="Local bind host (client mode)")
-    parser.add_argument(
-        "--local-port",
-        type=int,
-        required=("client" in sys.argv),
-        help="Local bind port (client mode)",
-    )
+    client_group = parser.add_argument_group("Client mode arguments")
+    client_group.add_argument("--local-host", default="localhost", help="Local bind host")
+    client_group.add_argument("--local-port", type=int, help="Local bind port")
 
     args = parser.parse_args()
+
+    # Validate mode-specific arguments
+    if args.mode == "server" and not args.service_port:
+        parser.error("--service-port is required for server mode")
+    if args.mode == "client" and not args.local_port:
+        parser.error("--local-port is required for client mode")
 
     try:
         tunnel = MQTTTunnel(
@@ -531,12 +581,8 @@ def main():
         )
 
         if args.mode == "server":
-            if not args.service_port:
-                parser.error("--service-port is required for server mode")
             tunnel.start_server(args.service_host, args.service_port)
         else:
-            if not args.local_port:
-                parser.error("--local-port is required for client mode")
             tunnel.start_client(args.local_host, args.local_port)
 
     except Exception as e:
