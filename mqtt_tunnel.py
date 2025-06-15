@@ -236,24 +236,54 @@ class MQTTTunnel:
                 return
 
             service_sock.settimeout(5)  # Reset timeout for health checks
-            self.send_control_message("service_ready", conn_id)
 
             # Create MQTT client for this connection
             mqtt_client = self.create_mqtt_client()
+
+            # Add events to track connection and subscription status
+            connected_event = threading.Event()
+            subscribed_event = threading.Event()
+
+            def on_connect(client, userdata, flags, rc):
+                if rc == 0:
+                    connected_event.set()
+                else:
+                    self.log.error(f"Connection failed: {mqtt.connack_string(rc)}")
+
+            def on_subscribe(client, userdata, mid, granted_qos):
+                subscribed_event.set()
+
+            mqtt_client.on_connect = on_connect
+            mqtt_client.on_subscribe = on_subscribe
+
             mqtt_client.connect(self.profile["host"], int(self.profile["port"]), self.keepalive)
             mqtt_client.loop_start()
 
-            # Store connection
-            self.connections[conn_id] = (service_sock, mqtt_client)
+            # Wait for MQTT connection
+            if not connected_event.wait(timeout=10):
+                self.log.error("MQTT connection timed out")
+                raise TimeoutError("MQTT connection timeout")
 
             # Set up data channels
-            outbound_topic = f"{self.topic_prefix}/{conn_id}/outbound"  # Client -> Server
-            inbound_topic = f"{self.topic_prefix}/{conn_id}/inbound"  # Server -> Client
+            outbound_topic = f"{self.topic_prefix}/{conn_id}/outbound"
+            inbound_topic = f"{self.topic_prefix}/{conn_id}/inbound"
 
-            # Subscribe to outbound data (client->server)
+            # Subscribe to outbound data
             mqtt_client.subscribe(outbound_topic, qos=1)
+
+            # Wait for subscription confirmation
+            if not subscribed_event.wait(timeout=10):
+                self.log.error("MQTT subscription timed out")
+                raise TimeoutError("MQTT subscription timeout")
+
             self.log.debug(f"Server subscribed to: {outbound_topic}")
             self.log.debug(f"Server publishing to: {inbound_topic}")
+
+            # Now we're ready to notify client
+            self.send_control_message("service_ready", conn_id)
+
+            # Store connection
+            self.connections[conn_id] = (service_sock, mqtt_client)
 
             def mqtt_to_service():
                 def on_message(client, userdata, msg):
@@ -339,27 +369,12 @@ class MQTTTunnel:
 
     def handle_client_connection(self, conn_id: str, client_sock: socket.socket):
         """Client-side connection handler"""
-        mqtt_client = None
         try:
             # Set socket timeout for disconnect detection
             client_sock.settimeout(5)
 
-            # Create MQTT client for this connection
-            mqtt_client = self.create_mqtt_client()
-            mqtt_client.connect(self.profile["host"], int(self.profile["port"]), self.keepalive)
-            mqtt_client.loop_start()
-
-            # Store connection
-            self.connections[conn_id] = (client_sock, mqtt_client)
-
-            # Set up data channels
-            outbound_topic = f"{self.topic_prefix}/{conn_id}/outbound"  # Client -> Server
-            inbound_topic = f"{self.topic_prefix}/{conn_id}/inbound"  # Server -> Client
-
-            # Subscribe to inbound data (server->client)
-            mqtt_client.subscribe(inbound_topic, qos=1)
-            self.log.debug(f"Client subscribed to: {inbound_topic}")
-            self.log.debug(f"Client publishing to: {outbound_topic}")
+            # Store client socket temporarily
+            self.connections[conn_id] = (client_sock, None)
 
             # Notify server about new connection
             self.send_control_message("connect", conn_id)
@@ -413,6 +428,49 @@ class MQTTTunnel:
                 self.log.error("Cannot establish connection to service")
                 self.close_connection(conn_id)
                 return
+
+            # Create MQTT client now that service is ready
+            mqtt_client = self.create_mqtt_client()
+            connected_event = threading.Event()
+            subscribed_event = threading.Event()
+
+            def on_connect(client, userdata, flags, rc):
+                if rc == 0:
+                    connected_event.set()
+                else:
+                    self.log.error(f"Connection failed: {mqtt.connack_string(rc)}")
+
+            def on_subscribe(client, userdata, mid, granted_qos):
+                subscribed_event.set()
+
+            mqtt_client.on_connect = on_connect
+            mqtt_client.on_subscribe = on_subscribe
+
+            mqtt_client.connect(self.profile["host"], int(self.profile["port"]), self.keepalive)
+            mqtt_client.loop_start()
+
+            # Wait for MQTT connection
+            if not connected_event.wait(timeout=10):
+                self.log.error("MQTT connection timed out")
+                raise TimeoutError("MQTT connection timeout")
+
+            # Set up data channels
+            outbound_topic = f"{self.topic_prefix}/{conn_id}/outbound"
+            inbound_topic = f"{self.topic_prefix}/{conn_id}/inbound"
+
+            # Subscribe to inbound data
+            mqtt_client.subscribe(inbound_topic, qos=1)
+
+            # Wait for subscription confirmation
+            if not subscribed_event.wait(timeout=10):
+                self.log.error("MQTT subscription timed out")
+                raise TimeoutError("MQTT subscription timeout")
+
+            self.log.debug(f"Client subscribed to: {inbound_topic}")
+            self.log.debug(f"Client publishing to: {outbound_topic}")
+
+            # Update connection with MQTT client
+            self.connections[conn_id] = (client_sock, mqtt_client)
 
             def mqtt_to_client():
                 def on_message(client, userdata, msg):
@@ -484,14 +542,11 @@ class MQTTTunnel:
 
         except Exception as e:
             self.log.error(f"Client connection setup failed: {str(e)}")
-            if client_sock:
-                client_sock.close()
-            if mqtt_client:
-                try:
-                    mqtt_client.loop_stop()
-                    mqtt_client.disconnect()
-                except:
-                    pass
+            if conn_id in self.connections:
+                client_sock = self.connections[conn_id][0]
+                if client_sock:
+                    client_sock.close()
+                del self.connections[conn_id]
             self.send_control_message("disconnect", conn_id)
 
     def send_control_message(self, action: str, conn_id: str):
