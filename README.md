@@ -4,7 +4,7 @@ Tools for piping data through MQTT brokers
 
 ## Installation
 ```bash
-git clone https://github.com/yourusername/mqtt-pipe-tools.git
+git clone https://github.com/Mohammad-Saad-Acacus/mqtt-pipe-tools.git
 cd mqtt-pipe-tools
 pip install -r requirements.txt
 ```
