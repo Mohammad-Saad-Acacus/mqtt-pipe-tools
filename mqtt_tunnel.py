@@ -276,6 +276,9 @@ class MQTTTunnel:
 
         # Start TCP server
         server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
         server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server_sock.bind((local_host, local_port))
         server_sock.listen(5)
@@ -333,6 +336,10 @@ class MQTTTunnel:
 
             try:
                 service_sock.connect((service_host, service_port))
+                self.optimize_ssh(service_sock)
+                service_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                service_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+                service_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
             except (ConnectionRefusedError, TimeoutError) as e:
                 self.log.error(f"Service connection failed: {str(e)}")
                 self.send_control_message("service_unavailable", conn_id)
@@ -427,7 +434,8 @@ class MQTTTunnel:
                 nonlocal last_activity
                 while not self.shutdown_event.is_set() and conn_id in self.connections:
                     try:
-                        data = service_sock.recv(4096)
+                        # Increase buffer size to 16384 for SSH
+                        data = service_sock.recv(16384)  # Changed from 4096 to 16384
                         if not data:
                             self.log.info("Service closed connection")
                             self.close_connection(conn_id)
@@ -435,7 +443,8 @@ class MQTTTunnel:
                         # Encrypt data with topic as AAD
                         encrypted_data = self.encryptor.encrypt(data, inbound_topic.encode())
                         self.log.debug(f"SERVICE->MQTT: {len(data)} bytes")
-                        mqtt_client.publish(inbound_topic, encrypted_data, qos=1)
+                        # Change QoS to 0 for lower latency
+                        mqtt_client.publish(inbound_topic, encrypted_data, qos=0)
                         last_activity = time.time()
                         with self.connections_lock:
                             self.connection_activity[conn_id] = last_activity
@@ -508,6 +517,10 @@ class MQTTTunnel:
         try:
             # Set socket timeout for disconnect detection
             client_sock.settimeout(5)
+            self.optimize_ssh(client_sock)
+            client_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            client_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+            client_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
 
             # Store client socket temporarily
             with self.connections_lock:
@@ -645,7 +658,8 @@ class MQTTTunnel:
                 nonlocal last_activity
                 while not self.shutdown_event.is_set() and conn_id in self.connections:
                     try:
-                        data = client_sock.recv(4096)
+                        # Increase buffer size to 16384 for SSH
+                        data = client_sock.recv(16384)  # Changed from 4096 to 16384
                         if not data:
                             self.log.info("Client closed connection")
                             self.close_connection(conn_id)
@@ -653,7 +667,8 @@ class MQTTTunnel:
                         # Encrypt data with topic as AAD
                         encrypted_data = self.encryptor.encrypt(data, outbound_topic.encode())
                         self.log.debug(f"CLIENT->MQTT: {len(data)} bytes")
-                        mqtt_client.publish(outbound_topic, encrypted_data, qos=1)
+                        # Change QoS to 0 for lower latency
+                        mqtt_client.publish(outbound_topic, encrypted_data, qos=0)
                         last_activity = time.time()
                         with self.connections_lock:
                             self.connection_activity[conn_id] = last_activity
@@ -800,6 +815,22 @@ class MQTTTunnel:
                 pass
 
         self.log.info("Cleanup complete")
+
+    def optimize_ssh(self, sock: socket.socket):
+        """Apply SSH-specific socket optimizations"""
+        try:
+            # Disable Nagle's algorithm
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+            # Increase socket buffers
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+
+            # Reduce ACK delay (Linux only)
+            if hasattr(socket, "TCP_QUICKACK"):
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_QUICKACK, 1)
+        except Exception as e:
+            self.log.warning(f"Socket optimization failed: {str(e)}")
 
 
 def main():
