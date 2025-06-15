@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import argparse
+import base64
 import json
 import logging
+import os
 import queue
 import signal
 import socket
@@ -12,6 +14,54 @@ import uuid
 from typing import Dict, Optional, Tuple
 
 import paho.mqtt.client as mqtt
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+
+
+class Encryptor:
+    """Handles AES-GCM encryption/decryption with key derivation"""
+
+    def __init__(self, password: Optional[str] = None, salt: bytes = b"", iterations: int = 100000):
+        self.key = None
+        if password:
+            self.derive_key(password.encode(), salt, iterations)
+
+    def derive_key(self, password: bytes, salt: bytes, iterations: int):
+        """Derive a key from password using PBKDF2"""
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt,
+            iterations=iterations,
+            backend=default_backend(),
+        )
+        self.key = kdf.derive(password)
+
+    def encrypt(self, plaintext: bytes) -> bytes:
+        """Encrypt data with AES-GCM"""
+        if not self.key:
+            return plaintext
+
+        nonce = os.urandom(12)
+        aesgcm = AESGCM(self.key)
+        ciphertext = aesgcm.encrypt(nonce, plaintext, None)
+        return nonce + ciphertext
+
+    def decrypt(self, ciphertext: bytes) -> bytes:
+        """Decrypt data with AES-GCM"""
+        if not self.key or len(ciphertext) < 12:
+            return ciphertext
+
+        nonce = ciphertext[:12]
+        ciphertext = ciphertext[12:]
+        aesgcm = AESGCM(self.key)
+        try:
+            return aesgcm.decrypt(nonce, ciphertext, None)
+        except Exception as e:
+            logging.error(f"Decryption failed: {str(e)}")
+            return b""
 
 
 class MQTTTunnel:
@@ -31,8 +81,15 @@ class MQTTTunnel:
         self.connections: Dict[str, Tuple[socket.socket, mqtt.Client]] = {}
         self.control_queue = queue.Queue()
         self.shutdown_event = threading.Event()
-        self.active_connections = threading.BoundedSemaphore(100)  # Limit concurrent connections
-        self.connection_timeout = 5  # Seconds to wait for service connection
+        self.active_connections = threading.BoundedSemaphore(100)
+        self.connection_timeout = 5
+
+        # Initialize encryption
+        self.encryptor = Encryptor(
+            password=self.profile.get("encryption_key"),
+            salt=base64.b64decode(self.profile.get("encryption_salt", "")),
+            iterations=self.profile.get("encryption_iterations", 100000),
+        )
 
     def _setup_logging(self):
         level = logging.DEBUG if self.debug else logging.INFO
@@ -109,7 +166,9 @@ class MQTTTunnel:
 
         def on_message(client, userdata, msg):
             try:
-                payload = json.loads(msg.payload)
+                # Decrypt payload
+                payload = self.encryptor.decrypt(msg.payload)
+                payload = json.loads(payload)
                 self.log.debug(f"Control message: {payload}")
                 self.control_queue.put(payload)
             except Exception as e:
@@ -289,8 +348,10 @@ class MQTTTunnel:
                 def on_message(client, userdata, msg):
                     if msg.topic == outbound_topic and not self.shutdown_event.is_set():
                         try:
-                            self.log.debug(f"MQTT->SERVICE: {len(msg.payload)} bytes")
-                            service_sock.sendall(msg.payload)
+                            # Decrypt payload before sending to service
+                            payload = self.encryptor.decrypt(msg.payload)
+                            self.log.debug(f"MQTT->SERVICE: {len(payload)} bytes")
+                            service_sock.sendall(payload)
                         except (BrokenPipeError, ConnectionResetError) as e:
                             self.log.warning(f"Service write error: {str(e)}")
                             self.close_connection(conn_id)
@@ -311,8 +372,10 @@ class MQTTTunnel:
                             self.log.info("Service closed connection")
                             self.close_connection(conn_id)
                             break
+                        # Encrypt data before sending over MQTT
+                        encrypted_data = self.encryptor.encrypt(data)
                         self.log.debug(f"SERVICE->MQTT: {len(data)} bytes")
-                        mqtt_client.publish(inbound_topic, data, qos=1)
+                        mqtt_client.publish(inbound_topic, encrypted_data, qos=1)
                     except socket.timeout:
                         continue  # Timeout is normal for non-blocking
                     except (ConnectionResetError, BrokenPipeError) as e:
@@ -369,6 +432,7 @@ class MQTTTunnel:
 
     def handle_client_connection(self, conn_id: str, client_sock: socket.socket):
         """Client-side connection handler"""
+        mqtt_client = None
         try:
             # Set socket timeout for disconnect detection
             client_sock.settimeout(5)
@@ -476,8 +540,10 @@ class MQTTTunnel:
                 def on_message(client, userdata, msg):
                     if msg.topic == inbound_topic and not self.shutdown_event.is_set():
                         try:
-                            self.log.debug(f"MQTT->CLIENT: {len(msg.payload)} bytes")
-                            client_sock.sendall(msg.payload)
+                            # Decrypt payload before sending to client
+                            payload = self.encryptor.decrypt(msg.payload)
+                            self.log.debug(f"MQTT->CLIENT: {len(payload)} bytes")
+                            client_sock.sendall(payload)
                         except (BrokenPipeError, ConnectionResetError) as e:
                             self.log.warning(f"Client write error: {str(e)}")
                             self.close_connection(conn_id)
@@ -498,8 +564,10 @@ class MQTTTunnel:
                             self.log.info("Client closed connection")
                             self.close_connection(conn_id)
                             break
+                        # Encrypt data before sending over MQTT
+                        encrypted_data = self.encryptor.encrypt(data)
                         self.log.debug(f"CLIENT->MQTT: {len(data)} bytes")
-                        mqtt_client.publish(outbound_topic, data, qos=1)
+                        mqtt_client.publish(outbound_topic, encrypted_data, qos=1)
                     except socket.timeout:
                         continue  # Timeout is normal for non-blocking
                     except (ConnectionResetError, BrokenPipeError) as e:
@@ -550,9 +618,15 @@ class MQTTTunnel:
             self.send_control_message("disconnect", conn_id)
 
     def send_control_message(self, action: str, conn_id: str):
-        payload = json.dumps({"action": action, "conn_id": conn_id, "timestamp": time.time()})
+        payload = json.dumps(
+            {"action": action, "conn_id": conn_id, "timestamp": time.time()}
+        ).encode()
+
+        # Encrypt control messages
+        encrypted_payload = self.encryptor.encrypt(payload)
+
         topic = f"{self.topic_prefix}/control"
-        result = self.control_client.publish(topic, payload, qos=1)
+        result = self.control_client.publish(topic, encrypted_payload, qos=1)
         if self.debug:
             try:
                 result.wait_for_publish(timeout=1)
@@ -566,8 +640,9 @@ class MQTTTunnel:
             sock, mqtt_client = self.connections[conn_id]
             try:
                 # Stop MQTT client properly
-                mqtt_client.loop_stop()
-                mqtt_client.disconnect()
+                if mqtt_client:
+                    mqtt_client.loop_stop()
+                    mqtt_client.disconnect()
             except Exception as e:
                 self.log.warning(f"MQTT cleanup error: {str(e)}")
             try:
