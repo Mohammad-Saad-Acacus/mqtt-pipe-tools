@@ -1,0 +1,13 @@
+{
+    "production": {
+        "host": "mqtt.example.com",
+        "port": 1883,
+        "username": "user",
+        "password": "pass",
+        "keepalive": 60
+    },
+    "test": {
+        "host": "test.mosquitto.org",
+        "port": 1883
+    }
+}
