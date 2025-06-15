@@ -21,9 +21,9 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 
 class Encryptor:
-    """Handles AES-GCM encryption/decryption with key derivation"""
+    """Handles AES-GCM encryption/decryption with key derivation and AAD"""
 
-    def __init__(self, password: Optional[str] = None, salt: bytes = b"", iterations: int = 100000):
+    def __init__(self, password: Optional[str] = None, salt: bytes = b"", iterations: int = 210000):
         self.key = None
         if password:
             self.derive_key(password.encode(), salt, iterations)
@@ -39,18 +39,18 @@ class Encryptor:
         )
         self.key = kdf.derive(password)
 
-    def encrypt(self, plaintext: bytes) -> bytes:
-        """Encrypt data with AES-GCM"""
+    def encrypt(self, plaintext: bytes, aad: bytes) -> bytes:
+        """Encrypt data with AES-GCM using Additional Authenticated Data (AAD)"""
         if not self.key:
             return plaintext
 
         nonce = os.urandom(12)
         aesgcm = AESGCM(self.key)
-        ciphertext = aesgcm.encrypt(nonce, plaintext, None)
+        ciphertext = aesgcm.encrypt(nonce, plaintext, aad)
         return nonce + ciphertext
 
-    def decrypt(self, ciphertext: bytes) -> bytes:
-        """Decrypt data with AES-GCM"""
+    def decrypt(self, ciphertext: bytes, aad: bytes) -> bytes:
+        """Decrypt data with AES-GCM using Additional Authenticated Data (AAD)"""
         if not self.key or len(ciphertext) < 12:
             return ciphertext
 
@@ -58,9 +58,10 @@ class Encryptor:
         ciphertext = ciphertext[12:]
         aesgcm = AESGCM(self.key)
         try:
-            return aesgcm.decrypt(nonce, ciphertext, None)
+            return aesgcm.decrypt(nonce, ciphertext, aad)
         except Exception as e:
             logging.error(f"Decryption failed: {str(e)}")
+            # Return empty bytes instead of corrupted data
             return b""
 
 
@@ -166,8 +167,8 @@ class MQTTTunnel:
 
         def on_message(client, userdata, msg):
             try:
-                # Decrypt payload
-                payload = self.encryptor.decrypt(msg.payload)
+                # Decrypt payload, use topic as AAD
+                payload = self.encryptor.decrypt(msg.payload, msg.topic.encode())
                 payload = json.loads(payload)
                 self.log.debug(f"Control message: {payload}")
                 self.control_queue.put(payload)
@@ -349,7 +350,7 @@ class MQTTTunnel:
                     if msg.topic == outbound_topic and not self.shutdown_event.is_set():
                         try:
                             # Decrypt payload before sending to service
-                            payload = self.encryptor.decrypt(msg.payload)
+                            payload = self.encryptor.decrypt(msg.payload, msg.topic.encode())
                             self.log.debug(f"MQTT->SERVICE: {len(payload)} bytes")
                             service_sock.sendall(payload)
                         except (BrokenPipeError, ConnectionResetError) as e:
@@ -373,7 +374,7 @@ class MQTTTunnel:
                             self.close_connection(conn_id)
                             break
                         # Encrypt data before sending over MQTT
-                        encrypted_data = self.encryptor.encrypt(data)
+                        encrypted_data = self.encryptor.encrypt(data, inbound_topic.encode())
                         self.log.debug(f"SERVICE->MQTT: {len(data)} bytes")
                         mqtt_client.publish(inbound_topic, encrypted_data, qos=1)
                     except socket.timeout:
@@ -541,7 +542,7 @@ class MQTTTunnel:
                     if msg.topic == inbound_topic and not self.shutdown_event.is_set():
                         try:
                             # Decrypt payload before sending to client
-                            payload = self.encryptor.decrypt(msg.payload)
+                            payload = self.encryptor.decrypt(msg.payload, msg.topic.encode())
                             self.log.debug(f"MQTT->CLIENT: {len(payload)} bytes")
                             client_sock.sendall(payload)
                         except (BrokenPipeError, ConnectionResetError) as e:
@@ -565,7 +566,7 @@ class MQTTTunnel:
                             self.close_connection(conn_id)
                             break
                         # Encrypt data before sending over MQTT
-                        encrypted_data = self.encryptor.encrypt(data)
+                        encrypted_data = self.encryptor.encrypt(data, outbound_topic.encode())
                         self.log.debug(f"CLIENT->MQTT: {len(data)} bytes")
                         mqtt_client.publish(outbound_topic, encrypted_data, qos=1)
                     except socket.timeout:
@@ -622,10 +623,11 @@ class MQTTTunnel:
             {"action": action, "conn_id": conn_id, "timestamp": time.time()}
         ).encode()
 
-        # Encrypt control messages
-        encrypted_payload = self.encryptor.encrypt(payload)
-
         topic = f"{self.topic_prefix}/control"
+
+        # Encrypt control messages
+        encrypted_payload = self.encryptor.encrypt(payload, topic.encode())
+
         result = self.control_client.publish(topic, encrypted_payload, qos=1)
         if self.debug:
             try:
