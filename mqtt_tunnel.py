@@ -99,6 +99,7 @@ class MQTTTunnel:
 
         self.control_seq = {}  # Outbound sequence numbers
         self.control_recv_seq = {}  # Inbound sequence tracking by (conn_id, sender_id)
+        self.data_ready_events = {}
 
     def _setup_logging(self):
         level = logging.DEBUG if self.debug else logging.INFO
@@ -257,6 +258,10 @@ class MQTTTunnel:
                         if conn_id in self.connections:
                             self.log.info(f"Remote requested disconnect: {conn_id}")
                             self.close_connection(conn_id, notify=False)
+                    elif msg.get("action") == "data_ready":
+                        conn_id = msg["conn_id"]
+                        if conn_id in self.data_ready_events:
+                            self.data_ready_events[conn_id].set()
                 except queue.Empty:
                     continue
 
@@ -395,6 +400,17 @@ class MQTTTunnel:
 
             # Now we're ready to notify client
             self.send_control_message("service_ready", conn_id)
+
+            # wait for data_ready
+            data_ready_event = threading.Event()
+            with self.connections_lock:
+                self.data_ready_events[conn_id] = data_ready_event
+
+            # Wait for client to confirm data channel is ready
+            if not data_ready_event.wait(timeout=10):
+                self.log.error(f"Data channel setup timed out for {conn_id}")
+                self.close_connection(conn_id)
+                return
 
             # Store connection
             with self.connections_lock:
@@ -617,6 +633,9 @@ class MQTTTunnel:
                 self.log.error("MQTT subscription timed out")
                 raise TimeoutError("MQTT subscription timeout")
 
+            # Notify server data channel is ready
+            self.send_control_message("data_ready", conn_id)
+
             self.log.debug(f"Client subscribed to: {inbound_topic}")
             self.log.debug(f"Client publishing to: {outbound_topic}")
 
@@ -777,6 +796,8 @@ class MQTTTunnel:
             del self.connections[conn_id]
             if conn_id in self.connection_activity:
                 del self.connection_activity[conn_id]
+            if conn_id in self.data_ready_events:
+                del self.data_ready_events[conn_id]
             if notify:
                 self.send_control_message("disconnect", conn_id)
 
