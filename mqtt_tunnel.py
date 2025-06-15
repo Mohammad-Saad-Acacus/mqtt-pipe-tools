@@ -26,6 +26,8 @@ class Encryptor:
     def __init__(self, password: Optional[str] = None, salt: bytes = b"", iterations: int = 210000):
         self.key = None
         if password:
+            if len(password) < 32:
+                raise ValueError("Encryption key must be at least 32 characters")
             self.derive_key(password.encode(), salt, iterations)
 
     def derive_key(self, password: bytes, salt: bytes, iterations: int):
@@ -61,7 +63,6 @@ class Encryptor:
             return aesgcm.decrypt(nonce, ciphertext, aad)
         except Exception as e:
             logging.error(f"Decryption failed: {str(e)}")
-            # Return empty bytes instead of corrupted data
             return b""
 
 
@@ -84,13 +85,20 @@ class MQTTTunnel:
         self.shutdown_event = threading.Event()
         self.active_connections = threading.BoundedSemaphore(100)
         self.connection_timeout = 5
+        self.connections_lock = threading.RLock()
+        self.control_seq = {}
+        self.control_recv_seq = {}
+        self.connection_activity = {}
 
         # Initialize encryption
         self.encryptor = Encryptor(
             password=self.profile.get("encryption_key"),
             salt=base64.b64decode(self.profile.get("encryption_salt", "")),
-            iterations=self.profile.get("encryption_iterations", 100000),
+            iterations=self.profile.get("encryption_iterations", 210000),
         )
+
+        self.control_seq = {}  # Outbound sequence numbers
+        self.control_recv_seq = {}  # Inbound sequence tracking by (conn_id, sender_id)
 
     def _setup_logging(self):
         level = logging.DEBUG if self.debug else logging.INFO
@@ -133,9 +141,10 @@ class MQTTTunnel:
                 "tlsv1.1": ssl.PROTOCOL_TLSv1_1,
                 "tlsv1.2": ssl.PROTOCOL_TLSv1_2,
                 "tls": ssl.PROTOCOL_TLS,
+                "tlsv1.3": getattr(ssl, "PROTOCOL_TLSv1_3", ssl.PROTOCOL_TLS),
             }
             tls_version = tls_version_map.get(
-                self.profile.get("tls_version", "tlsv1.2"), ssl.PROTOCOL_TLS
+                self.profile.get("tls_version", "tlsv1.2"), ssl.PROTOCOL_TLSv1_2
             )
 
             client.tls_set(
@@ -154,6 +163,8 @@ class MQTTTunnel:
 
     def setup_control_channel(self):
         self.control_client = self.create_mqtt_client()
+        # Convert to string
+        self.control_client_id_str = self.control_client._client_id.decode("utf-8")
         control_topic = f"{self.topic_prefix}/control"
 
         def on_connect(client, userdata, flags, rc):
@@ -167,9 +178,32 @@ class MQTTTunnel:
 
         def on_message(client, userdata, msg):
             try:
-                # Decrypt payload, use topic as AAD
                 payload = self.encryptor.decrypt(msg.payload, msg.topic.encode())
                 payload = json.loads(payload)
+
+                # Validate required fields
+                if "sender_id" not in payload or "conn_id" not in payload or "seq" not in payload:
+                    self.log.error("Invalid control message: missing required fields")
+                    return
+
+                sender_id = payload["sender_id"]
+                conn_id = payload["conn_id"]
+                seq = payload["seq"]
+
+                # Ignore messages from self
+                if sender_id == self.control_client_id_str:
+                    return
+
+                # Create unique key for this connection and sender
+                seq_key = (conn_id, sender_id)
+
+                # Sequence validation
+                if seq_key in self.control_recv_seq:
+                    if seq <= self.control_recv_seq[seq_key]:
+                        self.log.warning(f"Stale control message for {conn_id} from {sender_id}")
+                        return
+                self.control_recv_seq[seq_key] = seq
+
                 self.log.debug(f"Control message: {payload}")
                 self.control_queue.put(payload)
             except Exception as e:
@@ -246,6 +280,7 @@ class MQTTTunnel:
         server_sock.bind((local_host, local_port))
         server_sock.listen(5)
         server_sock.settimeout(1)  # Make socket non-blocking with timeout
+        self.server_sock = server_sock  # Store for cleanup
 
         def accept_connections():
             while not self.shutdown_event.is_set():
@@ -262,9 +297,21 @@ class MQTTTunnel:
                 except socket.timeout:
                     continue
                 except OSError as e:
-                    if not self.shutdown_event.is_set():
+                    if e.errno == 9:  # Bad file descriptor
+                        if not self.shutdown_event.is_set():
+                            self.log.critical("Server socket closed unexpectedly!")
+                            self.shutdown_event.set()
+                        break
+                    elif not self.shutdown_event.is_set():
                         self.log.error(f"Accept error: {str(e)}")
-            server_sock.close()
+                except Exception as e:
+                    if not self.shutdown_event.is_set():
+                        self.log.error(f"Unexpected accept error: {str(e)}")
+                        self.shutdown_event.set()
+            try:
+                server_sock.close()
+            except:
+                pass
 
         threading.Thread(target=accept_connections, daemon=True, name="accept-thread").start()
 
@@ -343,16 +390,27 @@ class MQTTTunnel:
             self.send_control_message("service_ready", conn_id)
 
             # Store connection
-            self.connections[conn_id] = (service_sock, mqtt_client)
+            with self.connections_lock:
+                self.connections[conn_id] = (service_sock, mqtt_client)
+                self.connection_activity[conn_id] = time.time()
+
+            last_activity = time.time()
 
             def mqtt_to_service():
+                nonlocal last_activity
+
                 def on_message(client, userdata, msg):
+                    nonlocal last_activity
                     if msg.topic == outbound_topic and not self.shutdown_event.is_set():
                         try:
-                            # Decrypt payload before sending to service
+                            # Decrypt payload with topic as AAD
                             payload = self.encryptor.decrypt(msg.payload, msg.topic.encode())
-                            self.log.debug(f"MQTT->SERVICE: {len(payload)} bytes")
-                            service_sock.sendall(payload)
+                            if payload:
+                                self.log.debug(f"MQTT->SERVICE: {len(payload)} bytes")
+                                service_sock.sendall(payload)
+                                last_activity = time.time()
+                                with self.connections_lock:
+                                    self.connection_activity[conn_id] = last_activity
                         except (BrokenPipeError, ConnectionResetError) as e:
                             self.log.warning(f"Service write error: {str(e)}")
                             self.close_connection(conn_id)
@@ -366,6 +424,7 @@ class MQTTTunnel:
                     time.sleep(0.1)
 
             def service_to_mqtt():
+                nonlocal last_activity
                 while not self.shutdown_event.is_set() and conn_id in self.connections:
                     try:
                         data = service_sock.recv(4096)
@@ -373,10 +432,13 @@ class MQTTTunnel:
                             self.log.info("Service closed connection")
                             self.close_connection(conn_id)
                             break
-                        # Encrypt data before sending over MQTT
+                        # Encrypt data with topic as AAD
                         encrypted_data = self.encryptor.encrypt(data, inbound_topic.encode())
                         self.log.debug(f"SERVICE->MQTT: {len(data)} bytes")
                         mqtt_client.publish(inbound_topic, encrypted_data, qos=1)
+                        last_activity = time.time()
+                        with self.connections_lock:
+                            self.connection_activity[conn_id] = last_activity
                     except socket.timeout:
                         continue  # Timeout is normal for non-blocking
                     except (ConnectionResetError, BrokenPipeError) as e:
@@ -405,6 +467,12 @@ class MQTTTunnel:
                 try:
                     # Test if socket is still alive
                     service_sock.send(b"")
+
+                    # Activity timeout check
+                    if time.time() - last_activity > self.keepalive * 3:
+                        self.log.warning(f"Connection {conn_id} timed out due to inactivity")
+                        self.close_connection(conn_id)
+                        break
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     self.log.info("Service connection lost")
                     self.close_connection(conn_id)
@@ -430,6 +498,9 @@ class MQTTTunnel:
             self.send_control_message("disconnect", conn_id)
         finally:
             self.active_connections.release()
+            with self.connections_lock:
+                if conn_id in self.connection_activity:
+                    del self.connection_activity[conn_id]
 
     def handle_client_connection(self, conn_id: str, client_sock: socket.socket):
         """Client-side connection handler"""
@@ -439,7 +510,9 @@ class MQTTTunnel:
             client_sock.settimeout(5)
 
             # Store client socket temporarily
-            self.connections[conn_id] = (client_sock, None)
+            with self.connections_lock:
+                self.connections[conn_id] = (client_sock, None)
+                self.connection_activity[conn_id] = time.time()
 
             # Notify server about new connection
             self.send_control_message("connect", conn_id)
@@ -535,16 +608,27 @@ class MQTTTunnel:
             self.log.debug(f"Client publishing to: {outbound_topic}")
 
             # Update connection with MQTT client
-            self.connections[conn_id] = (client_sock, mqtt_client)
+            with self.connections_lock:
+                self.connections[conn_id] = (client_sock, mqtt_client)
+                self.connection_activity[conn_id] = time.time()
+
+            last_activity = time.time()
 
             def mqtt_to_client():
+                nonlocal last_activity
+
                 def on_message(client, userdata, msg):
+                    nonlocal last_activity
                     if msg.topic == inbound_topic and not self.shutdown_event.is_set():
                         try:
-                            # Decrypt payload before sending to client
+                            # Decrypt payload with topic as AAD
                             payload = self.encryptor.decrypt(msg.payload, msg.topic.encode())
-                            self.log.debug(f"MQTT->CLIENT: {len(payload)} bytes")
-                            client_sock.sendall(payload)
+                            if payload:
+                                self.log.debug(f"MQTT->CLIENT: {len(payload)} bytes")
+                                client_sock.sendall(payload)
+                                last_activity = time.time()
+                                with self.connections_lock:
+                                    self.connection_activity[conn_id] = last_activity
                         except (BrokenPipeError, ConnectionResetError) as e:
                             self.log.warning(f"Client write error: {str(e)}")
                             self.close_connection(conn_id)
@@ -558,6 +642,7 @@ class MQTTTunnel:
                     time.sleep(0.1)
 
             def client_to_mqtt():
+                nonlocal last_activity
                 while not self.shutdown_event.is_set() and conn_id in self.connections:
                     try:
                         data = client_sock.recv(4096)
@@ -565,10 +650,13 @@ class MQTTTunnel:
                             self.log.info("Client closed connection")
                             self.close_connection(conn_id)
                             break
-                        # Encrypt data before sending over MQTT
+                        # Encrypt data with topic as AAD
                         encrypted_data = self.encryptor.encrypt(data, outbound_topic.encode())
                         self.log.debug(f"CLIENT->MQTT: {len(data)} bytes")
                         mqtt_client.publish(outbound_topic, encrypted_data, qos=1)
+                        last_activity = time.time()
+                        with self.connections_lock:
+                            self.connection_activity[conn_id] = last_activity
                     except socket.timeout:
                         continue  # Timeout is normal for non-blocking
                     except (ConnectionResetError, BrokenPipeError) as e:
@@ -597,6 +685,12 @@ class MQTTTunnel:
                 try:
                     # Test if socket is still alive
                     client_sock.send(b"")
+
+                    # Activity timeout check
+                    if time.time() - last_activity > self.keepalive * 3:
+                        self.log.warning(f"Connection {conn_id} timed out due to inactivity")
+                        self.close_connection(conn_id)
+                        break
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     self.log.info("Client connection lost")
                     self.close_connection(conn_id)
@@ -615,17 +709,29 @@ class MQTTTunnel:
                 client_sock = self.connections[conn_id][0]
                 if client_sock:
                     client_sock.close()
-                del self.connections[conn_id]
+                with self.connections_lock:
+                    if conn_id in self.connections:
+                        del self.connections[conn_id]
             self.send_control_message("disconnect", conn_id)
+        finally:
+            with self.connections_lock:
+                if conn_id in self.connection_activity:
+                    del self.connection_activity[conn_id]
 
     def send_control_message(self, action: str, conn_id: str):
-        payload = json.dumps(
-            {"action": action, "conn_id": conn_id, "timestamp": time.time()}
-        ).encode()
+        # Get next sequence number
+        seq = self.control_seq.get(conn_id, 0)
+        payload_dict = {
+            "sender_id": self.control_client_id_str,  # Use string version
+            "action": action,
+            "conn_id": conn_id,
+            "timestamp": time.time(),
+            "seq": seq,
+        }
+        payload = json.dumps(payload_dict).encode()
+        self.control_seq[conn_id] = seq + 1  # Encrypt with topic as AAD
 
         topic = f"{self.topic_prefix}/control"
-
-        # Encrypt control messages
         encrypted_payload = self.encryptor.encrypt(payload, topic.encode())
 
         result = self.control_client.publish(topic, encrypted_payload, qos=1)
@@ -634,10 +740,12 @@ class MQTTTunnel:
                 result.wait_for_publish(timeout=1)
             except:
                 pass
-            self.log.debug(f"Sent control: {action} for {conn_id}")
+            self.log.debug(f"Sent control: {action} for {conn_id} (seq={seq})")
 
     def close_connection(self, conn_id: str, notify: bool = True):
-        if conn_id in self.connections:
+        with self.connections_lock:
+            if conn_id not in self.connections:
+                return
             self.log.info(f"Closing connection: {conn_id}")
             sock, mqtt_client = self.connections[conn_id]
             try:
@@ -652,6 +760,8 @@ class MQTTTunnel:
             except Exception as e:
                 self.log.warning(f"Socket close error: {str(e)}")
             del self.connections[conn_id]
+            if conn_id in self.connection_activity:
+                del self.connection_activity[conn_id]
             if notify:
                 self.send_control_message("disconnect", conn_id)
 
@@ -660,10 +770,18 @@ class MQTTTunnel:
         self.log.info(f"Received {signame}, shutting down...")
         self.shutdown_event.set()
 
+    def shutdown(self):
+        """Initiate graceful shutdown"""
+        if not self.shutdown_event.is_set():
+            self.log.info("Initiating shutdown sequence...")
+            self.shutdown_event.set()
+
     def cleanup(self):
         self.log.info("Cleaning up resources...")
         # Close all active connections
-        for conn_id in list(self.connections.keys()):
+        with self.connections_lock:
+            conn_ids = list(self.connections.keys())
+        for conn_id in conn_ids:
             self.close_connection(conn_id, notify=False)
 
         # Clean up control client
@@ -671,8 +789,16 @@ class MQTTTunnel:
             try:
                 self.control_client.loop_stop()
                 self.control_client.disconnect()
+            except Exception as e:
+                self.log.error(f"Control client cleanup error: {str(e)}")
+
+        # Close server socket in client mode
+        if hasattr(self, "server_sock"):
+            try:
+                self.server_sock.close()
             except:
                 pass
+
         self.log.info("Cleanup complete")
 
 
