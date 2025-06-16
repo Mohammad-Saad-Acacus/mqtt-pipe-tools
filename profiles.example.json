@@ -1,13 +1,39 @@
 {
-    "production": {
-        "host": "mqtt.example.com",
-        "port": 1883,
-        "username": "user",
-        "password": "pass",
-        "keepalive": 60
-    },
-    "test": {
-        "host": "test.mosquitto.org",
-        "port": 1883
-    }
+  "profile_name": {
+    "host": "broker.example.com",
+    "port": 8883,
+    "username": "user",
+    "password": "pass",
+    "tls": true,
+    "encryption_key": "your-strong-password-here",
+    "encryption_salt": "base64-encoded-salt",
+    "encryption_iterations": 200000
+  },
+  "emqx": {
+    "host": "broker.emqx.io",
+    "port": 1883,
+    "password": "",
+    "username": "",
+    "encryption_key": "your-strong-password-here",
+    "encryption_salt": "awrE4Xuzj8jSCMbVgRK4WA==",
+    "encryption_iterations": 200000
+  },
+  "mosquitto": {
+    "host": "test.mosquitto.org",
+    "port": 1883,
+    "password": "",
+    "username": "",
+    "encryption_key": "your-strong-password-here",
+    "encryption_salt": "awrE4Xuzj8jSCMbVgRK4WA==",
+    "encryption_iterations": 200000
+  },
+  "eclipse": {
+    "host": "mqtt.eclipseprojects.io",
+    "port": 1883,
+    "password": "",
+    "username": "",
+    "encryption_key": "your-strong-password-here",
+    "encryption_salt": "awrE4Xuzj8jSCMbVgRK4WA==",
+    "encryption_iterations": 200000
+  }
 }
