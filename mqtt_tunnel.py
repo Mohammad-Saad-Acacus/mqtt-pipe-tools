@@ -125,7 +125,10 @@ class MQTTTunnel:
 
     def create_mqtt_client(self, client_id: Optional[str] = None) -> mqtt.Client:
         client_id = client_id or f"mqtttunnel_{uuid.uuid4().hex[:8]}"
-        client = mqtt.Client(client_id=client_id, clean_session=True)
+        client = mqtt.Client(client_id=client_id, clean_session=True, protocol=mqtt.MQTTv311)
+        client.max_inflight_messages = 100  # Increase from default 20
+        client.max_queued_messages = 1000  # Increase from default 0 (unlimited)
+        client.reconnect_delay_set(min_delay=1, max_delay=60)
 
         # Set credentials if available
         username = self.profile.get("username", "").strip() or None
@@ -212,10 +215,14 @@ class MQTTTunnel:
 
         def on_disconnect(client, userdata, rc):
             if rc != 0 and not self.shutdown_event.is_set():
-                self.log.error(
-                    f"Control channel disconnected unexpectedly: {mqtt.error_string(rc)}"
+                self.log.warning(
+                    f"Control channel disconnected unexpectedly {mqtt.error_string(rc)}, attempting reconnect..."
                 )
-                self.shutdown_event.set()
+                try:
+                    client.reconnect()
+                except:
+                    self.log.error("Reconnect failed")
+                    self.shutdown_event.set()
 
         self.control_client.on_connect = on_connect
         self.control_client.on_message = on_message
