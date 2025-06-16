@@ -288,9 +288,7 @@ class MQTTTunnel:
 
         # Start TCP server
         server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
-        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+        self.optimize_socket(server_sock)
         server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server_sock.bind((local_host, local_port))
         server_sock.listen(5)
@@ -348,10 +346,7 @@ class MQTTTunnel:
 
             try:
                 service_sock.connect((service_host, service_port))
-                self.optimize_ssh(service_sock)
-                service_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                service_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
-                service_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+                self.optimize_socket(service_sock)
             except (ConnectionRefusedError, TimeoutError) as e:
                 self.log.error(f"Service connection failed: {str(e)}")
                 self.send_control_message("service_unavailable", conn_id)
@@ -540,10 +535,7 @@ class MQTTTunnel:
         try:
             # Set socket timeout for disconnect detection
             client_sock.settimeout(5)
-            self.optimize_ssh(client_sock)
-            client_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            client_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
-            client_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+            self.optimize_socket(client_sock)
 
             # Store client socket temporarily
             with self.connections_lock:
@@ -844,8 +836,8 @@ class MQTTTunnel:
 
         self.log.info("Cleanup complete")
 
-    def optimize_ssh(self, sock: socket.socket):
-        """Apply SSH-specific socket optimizations"""
+    def optimize_socket(self, sock: socket.socket):
+        """Apply socket optimizations"""
         try:
             # Disable Nagle's algorithm
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
