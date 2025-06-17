@@ -9,15 +9,25 @@ import time
 
 import paho.mqtt.client as mqtt
 
-# Default values
-DEFAULT_CHUNK_SIZE = 1024 * 64
-DEFAULT_QOS = 0
-DEFAULT_KEEPALIVE = 60
-DEFAULT_MAX_PENDING = 10  # Maximum in-flight messages for throttling
-DEFAULT_QOS0_DELAY_MS = 1  # 1ms default delay for QoS 0
+# Default configuration
+DEFAULTS = {
+    "CHUNK_SIZE": 1024 * 64,
+    "QOS": 0,
+    "KEEPALIVE": 60,
+    "MAX_PENDING": 10,
+    "QOS0_DELAY_MS": 1,
+}
+
+# MQTT error mapping
+MQTT_ERRORS = {
+    mqtt.MQTT_ERR_CONN_LOST: "Broker connection lost",
+    mqtt.MQTT_ERR_CONN_REFUSED: "Connection refused",
+    mqtt.MQTT_ERR_NO_CONN: "No connection available",
+}
 
 
 def load_profiles(filename):
+    """Load MQTT profiles from JSON file"""
     try:
         with open(filename, "r") as f:
             return json.load(f)
@@ -26,42 +36,11 @@ def load_profiles(filename):
         sys.exit(1)
 
 
-def on_connect(client, userdata, flags, rc):
-    if rc == 0:
-        client.subscribe(userdata["subscribe_topic"], qos=userdata["qos"])
-        sys.stderr.write(
-            f"Connected to broker, subscribed to {userdata['subscribe_topic']} (QoS: {userdata['qos']})\n"
-        )
-    else:
-        sys.stderr.write(f"Connection failed with code {rc}\n")
-
-
-def on_message(client, userdata, msg):
-    sys.stdout.buffer.write(msg.payload)
-    sys.stdout.buffer.flush()
-
-
-def on_disconnect(client, userdata, rc):
-    userdata["disconnected"] = rc
-    if rc != 0:
-        # Map common disconnect reasons to human-readable messages
-        disconnect_messages = {
-            mqtt.MQTT_ERR_CONN_LOST: "Broker connection lost",
-            mqtt.MQTT_ERR_CONN_REFUSED: "Connection refused",
-            mqtt.MQTT_ERR_NO_CONN: "No connection available",
-        }
-        message = disconnect_messages.get(rc, f"Unexpected disconnect (rc: {rc})")
-        sys.stderr.write(f"{message}\n")
-
-
-# New callback for message acknowledgments
-def on_publish(client, userdata, mid):
-    """Called when a message is acknowledged by the broker"""
-    userdata["pending_count"] -= 1
-
-
-def main():
+def setup_arg_parser():
+    """Create and configure argument parser"""
     parser = argparse.ArgumentParser(description="MQTT Netcat-like Tool")
+
+    # Positional arguments
     parser.add_argument(
         "mode", choices=["listen", "connect"], help="Operation mode: listen or connect"
     )
@@ -74,37 +53,40 @@ def main():
         "--qos",
         type=int,
         choices=[0, 1, 2],
-        default=DEFAULT_QOS,
-        help=f"Quality of Service level (default: {DEFAULT_QOS})",
+        default=DEFAULTS["QOS"],
+        help=f"Quality of Service level (default: {DEFAULTS['QOS']})",
     )
     parser.add_argument(
         "--keepalive",
         type=int,
-        default=DEFAULT_KEEPALIVE,
-        help=f"Keepalive interval in seconds (default: {DEFAULT_KEEPALIVE})",
+        default=DEFAULTS["KEEPALIVE"],
+        help=f"Keepalive interval in seconds (default: {DEFAULTS['KEEPALIVE']})",
     )
     parser.add_argument(
         "--chunk-size",
         type=int,
-        default=DEFAULT_CHUNK_SIZE,
-        help=f"Chunk size for reading stdin (bytes, default: {DEFAULT_CHUNK_SIZE})",
+        default=DEFAULTS["CHUNK_SIZE"],
+        help=f"Chunk size for reading stdin (bytes, default: {DEFAULTS['CHUNK_SIZE']})",
     )
     parser.add_argument(
         "--max-pending",
         type=int,
-        default=DEFAULT_MAX_PENDING,
-        help=f"Max pending acknowledgments before throttling (default: {DEFAULT_MAX_PENDING})",
+        default=DEFAULTS["MAX_PENDING"],
+        help=f"Max pending acknowledgments before throttling (default: {DEFAULTS['MAX_PENDING']})",
     )
     parser.add_argument(
         "--qos0-delay",
         type=float,
-        default=DEFAULT_QOS0_DELAY_MS,
-        help=f"Delay between QoS 0 sends in milliseconds (default: {DEFAULT_QOS0_DELAY_MS} ms)",
+        default=DEFAULTS["QOS0_DELAY_MS"],
+        help=f"Delay between QoS 0 sends in milliseconds (default: {DEFAULTS['QOS0_DELAY_MS']} ms)",
     )
 
-    args = parser.parse_args()
+    return parser
 
-    # Validate and warn about chunk size
+
+def validate_arguments(args):
+    """Validate and warn about problematic argument values"""
+    # Validate chunk size
     if args.chunk_size < 256:
         sys.stderr.write("Warning: Small chunk sizes (<256B) may reduce performance\n")
     elif args.chunk_size > 1024 * 1024:
@@ -127,65 +109,103 @@ def main():
     elif args.qos0_delay > 100:  # 100ms
         sys.stderr.write("Warning: Large QoS 0 delay (>100ms) may reduce throughput\n")
 
-    # Set topics based on mode
-    if args.mode == "listen":
-        subscribe_topic = f"{args.prefix}/connect"
-        publish_topic = f"{args.prefix}/listen"
-    else:  # connect mode
-        subscribe_topic = f"{args.prefix}/listen"
-        publish_topic = f"{args.prefix}/connect"
+    return qos0_delay_seconds
 
-    # Load MQTT profile
-    profiles = load_profiles(args.profiles_file)
-    profile = profiles.get(args.profile_name)
-    if not profile:
-        sys.stderr.write(f"Profile '{args.profile_name}' not found\n")
+
+def get_topics(mode, prefix):
+    """Determine publish/subscribe topics based on operation mode"""
+    if mode == "listen":
+        return {"subscribe": f"{prefix}/connect", "publish": f"{prefix}/listen"}
+    return {"subscribe": f"{prefix}/listen", "publish": f"{prefix}/connect"}
+
+
+def configure_tls(client, profile):
+    """Configure TLS settings for MQTT client"""
+    if not profile.get("tls", False):
+        return
+
+    tls_args = {
+        "ca_certs": profile.get("ca_certs"),
+        "certfile": profile.get("certfile"),
+        "keyfile": profile.get("keyfile"),
+        "cert_reqs": ssl.CERT_REQUIRED,
+    }
+
+    # Allow self-signed certificates if requested
+    if profile.get("insecure", False):
+        tls_args["cert_reqs"] = ssl.CERT_NONE
+
+    # Remove None values from tls_args
+    tls_args = {k: v for k, v in tls_args.items() if v is not None}
+
+    try:
+        client.tls_set(**tls_args)
+        client.tls_insecure_set(profile.get("insecure", False))
+    except Exception as e:
+        sys.stderr.write(f"TLS setup error: {str(e)}\n")
         sys.exit(1)
 
-    # Configure MQTT client with clean session
+
+def on_connect(client, userdata, flags, rc):
+    """Callback when connection to broker is established"""
+    if rc == 0:
+        client.subscribe(userdata["topics"]["subscribe"], qos=userdata["qos"])
+        sys.stderr.write(
+            f"Connected to broker, subscribed to {userdata['topics']['subscribe']} "
+            f"(QoS: {userdata['qos']})\n"
+        )
+    else:
+        sys.stderr.write(f"Connection failed with code {rc}\n")
+
+
+def on_message(client, userdata, msg):
+    """Callback for received messages"""
+    sys.stdout.buffer.write(msg.payload)
+    sys.stdout.buffer.flush()
+
+
+def on_disconnect(client, userdata, rc):
+    """Callback when disconnected from broker"""
+    userdata["disconnected"] = rc
+    if rc != 0:
+        message = MQTT_ERRORS.get(rc, f"Unexpected disconnect (rc: {rc})")
+        sys.stderr.write(f"{message}\n")
+
+
+def on_publish(client, userdata, mid):
+    """Callback when message is acknowledged by broker"""
+    userdata["pending_count"] -= 1
+
+
+def setup_mqtt_client(profile, args, topics, qos0_delay_seconds):
+    """Create and configure MQTT client"""
+    # Userdata for sharing state with callbacks
     userdata = {
-        "subscribe_topic": subscribe_topic,
+        "topics": topics,
         "disconnected": None,
         "qos": args.qos,
-        "pending_count": 0,  # Track unacknowledged messages
-        "max_pending": args.max_pending,  # Max allowed in-flight messages
-        "current_chunk": None,  # For storing unsent data during throttling
+        "pending_count": 0,
+        "max_pending": args.max_pending,
+        "current_chunk": None,
+        "qos0_delay": qos0_delay_seconds,
     }
+
     client = mqtt.Client(clean_session=True, userdata=userdata)
+
+    # Register callbacks
     client.on_connect = on_connect
     client.on_message = on_message
     client.on_disconnect = on_disconnect
-    client.on_publish = on_publish  # For tracking message acknowledgments
+    client.on_publish = on_publish
 
     # Set credentials if available
     if "username" in profile and "password" in profile:
         client.username_pw_set(profile["username"].strip(), profile["password"].strip())
 
-    # TLS Configuration
-    tls_enabled = profile.get("tls", False)
-    if tls_enabled:
-        tls_args = {
-            "ca_certs": profile.get("ca_certs"),
-            "certfile": profile.get("certfile"),
-            "keyfile": profile.get("keyfile"),
-            "cert_reqs": ssl.CERT_REQUIRED,
-        }
+    # Configure TLS
+    configure_tls(client, profile)
 
-        # Allow self-signed certificates if requested
-        if profile.get("insecure", False):
-            tls_args["cert_reqs"] = ssl.CERT_NONE
-
-        # Remove None values from tls_args
-        tls_args = {k: v for k, v in tls_args.items() if v is not None}
-
-        try:
-            client.tls_set(**tls_args)
-            client.tls_insecure_set(profile.get("insecure", False))
-        except Exception as e:
-            sys.stderr.write(f"TLS setup error: {str(e)}\n")
-            sys.exit(1)
-
-    # Connect to broker with improved error handling
+    # Connect to broker with error handling
     try:
         client.connect(profile["host"], int(profile["port"]), args.keepalive)
     except ConnectionRefusedError:
@@ -198,12 +218,15 @@ def main():
         sys.stderr.write(f"Connection error: {str(e)}\n")
         sys.exit(1)
 
-    # Start MQTT loop in background thread
-    client.loop_start()
+    return client, userdata
 
-    # Signal handling
+
+def main_loop(client, userdata, chunk_size):
+    """Main processing loop with throttling and I/O handling"""
     running = True
+    last_send_time = 0
 
+    # Signal handler for graceful shutdown
     def signal_handler(sig, frame):
         nonlocal running
         sys.stderr.write("\nDisconnecting...\n")
@@ -215,78 +238,104 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    # Throttling variables
-    qos0_delay = qos0_delay_seconds  # Use user-specified delay in seconds
-    last_send_time = 0
-
-    # Read from stdin using non-blocking I/O with throttling
     try:
         while running:
-            # Check if we got an unexpected disconnect
+            # Check for disconnects
             if userdata["disconnected"] is not None:
                 if userdata["disconnected"] != 0:
                     sys.stderr.write("Disconnected from broker, exiting.\n")
-                    break
-                else:  # Normal disconnect
-                    break
+                break
 
-            # Throttling logic
+            # Determine if we can send more data
             credit_available = True
             if userdata["qos"] > 0:
-                # For QoS 1/2: Check pending acknowledgments
+                # QoS 1/2: Check pending acknowledgments
                 if userdata["pending_count"] >= userdata["max_pending"]:
                     credit_available = False
             else:
-                # For QoS 0: Rate limit sends using specified delay
+                # QoS 0: Rate limit using specified delay
                 current_time = time.monotonic()
-                if current_time - last_send_time < qos0_delay:
+                if current_time - last_send_time < userdata["qos0_delay"]:
                     credit_available = False
                 else:
                     last_send_time = current_time
 
-            # Check if there's data available to read
+            # Check for available data
             rlist, _, _ = select.select([sys.stdin], [], [], 0.1)
 
             if rlist and credit_available:
-                data = sys.stdin.buffer.read1(args.chunk_size)
+                # Read and send new data
+                data = sys.stdin.buffer.read1(chunk_size)
                 if not data:  # EOF
                     break
-                result = client.publish(publish_topic, data, qos=args.qos)
+                send_data(client, userdata, data)
 
-                # Track pending messages for QoS 1/2
-                if result.rc == mqtt.MQTT_ERR_SUCCESS:
-                    if args.qos > 0:
-                        userdata["pending_count"] += 1
-                else:
-                    sys.stderr.write(f"Publish failed (rc: {result.rc}), retrying...\n")
-                    # Store unsent data for retry
-                    userdata["current_chunk"] = data
-
-            # Retry sending any failed chunks when credit available
+            # Retry any failed chunks
             elif userdata["current_chunk"] and credit_available:
-                data = userdata["current_chunk"]
-                result = client.publish(publish_topic, data, qos=args.qos)
-                if result.rc == mqtt.MQTT_ERR_SUCCESS:
-                    if args.qos > 0:
-                        userdata["pending_count"] += 1
-                    userdata["current_chunk"] = None  # Clear stored chunk
-                else:
-                    sys.stderr.write(f"Retry failed (rc: {result.rc}), will retry...\n")
+                send_data(client, userdata, userdata["current_chunk"], retry=True)
 
-            # Brief pause to prevent busy-waiting
+            # Brief pause when throttled
             elif not credit_available:
-                time.sleep(min(0.01, qos0_delay))  # Sleep proportional to delay setting
+                sleep_time = min(0.01, userdata["qos0_delay"])
+                time.sleep(sleep_time)
 
     except BrokenPipeError:
-        pass
+        pass  # Output closed, normal termination
     except KeyboardInterrupt:
-        pass
+        pass  # User-initiated termination
     except Exception as e:
-        sys.stderr.write(f"Error: {str(e)}\n")
+        sys.stderr.write(f"Runtime error: {str(e)}\n")
     finally:
-        running = False
+        # Clean up resources
         client.disconnect()
         client.loop_stop()
+
+
+def send_data(client, userdata, data, retry=False):
+    """Publish data to MQTT broker with error handling"""
+    topic = userdata["topics"]["publish"]
+    qos = userdata["qos"]
+
+    result = client.publish(topic, data, qos=qos)
+
+    if result.rc == mqtt.MQTT_ERR_SUCCESS:
+        if qos > 0:
+            userdata["pending_count"] += 1
+        if retry:
+            userdata["current_chunk"] = None  # Clear stored chunk on successful retry
+    else:
+        error_msg = f"{'Retry' if retry else 'Publish'} failed (rc: {result.rc})"
+        if not retry:
+            error_msg += ", storing for retry"
+            userdata["current_chunk"] = data
+        sys.stderr.write(f"{error_msg}\n")
+
+
+def main():
+    """Main application entry point"""
+    # Parse and validate arguments
+    parser = setup_arg_parser()
+    args = parser.parse_args()
+    qos0_delay_seconds = validate_arguments(args)
+
+    # Load MQTT profile
+    profiles = load_profiles(args.profiles_file)
+    profile = profiles.get(args.profile_name)
+    if not profile:
+        sys.stderr.write(f"Profile '{args.profile_name}' not found\n")
+        sys.exit(1)
+
+    # Determine topics
+    topics = get_topics(args.mode, args.prefix)
+
+    # Setup MQTT client
+    client, userdata = setup_mqtt_client(profile, args, topics, qos0_delay_seconds)
+
+    # Start MQTT network loop
+    client.loop_start()
+
+    # Run main processing loop
+    main_loop(client, userdata, args.chunk_size)
 
 
 if __name__ == "__main__":
