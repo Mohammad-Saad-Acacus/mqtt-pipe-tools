@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import os
 import select
 import signal
 import ssl
 import sys
-import threading
 import time
 
 import paho.mqtt.client as mqtt
@@ -15,8 +15,8 @@ DEFAULT_CHUNK_SIZE = 1024 * 64
 DEFAULT_QOS = 0
 DEFAULT_KEEPALIVE = 60
 DEFAULT_HANDSHAKE_TIMEOUT = 5
-HELLO_MESSAGE = b"HELLO"
-HELLO_ACK_MESSAGE = b"HELLO_ACK"
+HELLO_PREFIX = b"HELLO:"
+HELLO_ACK_PREFIX = b"HELLO_ACK:"
 
 
 def load_profiles(filename):
@@ -26,6 +26,11 @@ def load_profiles(filename):
     except Exception as e:
         sys.stderr.write(f"Error loading profiles: {str(e)}\n")
         sys.exit(1)
+
+
+def generate_short_id():
+    """Generate a short 4-byte (8-character) hex ID"""
+    return os.urandom(4).hex()
 
 
 def on_connect(client, userdata, flags, rc):
@@ -40,23 +45,25 @@ def on_connect(client, userdata, flags, rc):
 
 def on_message(client, userdata, msg):
     # If we're waiting for a handshake acknowledgment
-    if userdata.get("waiting_for_ack"):
-        if msg.payload == HELLO_ACK_MESSAGE:
+    if userdata.get("waiting_for_ack") and msg.payload.startswith(HELLO_ACK_PREFIX):
+        ack_id = msg.payload[len(HELLO_ACK_PREFIX) :]
+        if ack_id == userdata["session_id"]:
             userdata["handshake_complete"] = True
             userdata["waiting_for_ack"] = False
             sys.stderr.write("Handshake acknowledged. Starting data transfer.\n")
         return
 
     # If we're in listen mode and receive a hello message
-    if (
-        userdata["mode"] == "listen"
-        and userdata.get("expect_hello")
-        and msg.payload == HELLO_MESSAGE
-    ):
+    if userdata.get("expect_hello") and msg.payload.startswith(HELLO_PREFIX):
+        session_id = msg.payload[len(HELLO_PREFIX) :]
         if userdata["handshake"]:
-            client.publish(userdata["publish_topic"], HELLO_ACK_MESSAGE, qos=userdata["qos"])
+            # Respond with ACK containing the same session ID
+            ack_msg = HELLO_ACK_PREFIX + session_id
+            client.publish(userdata["publish_topic"], ack_msg, qos=userdata["qos"])
             userdata["expect_hello"] = False
-            sys.stderr.write("Handshake received. Acknowledging and starting data transfer.\n")
+            sys.stderr.write(
+                f"Handshake received for session {session_id.decode()}. Acknowledging.\n"
+            )
         return
 
     # Normal data message
@@ -118,6 +125,11 @@ def main():
         default=1,
         help="Interval between hello retries in seconds (default: 1)",
     )
+    parser.add_argument(
+        "--session-id",
+        default="",
+        help="Custom session ID for connection (default: random 8-char hex)",
+    )
 
     args = parser.parse_args()
 
@@ -141,6 +153,16 @@ def main():
         sys.stderr.write(f"Profile '{args.profile_name}' not found\n")
         sys.exit(1)
 
+    # Generate session ID
+    if args.session_id:
+        session_id = args.session_id.encode()
+    else:
+        # Generate short 8-character hex ID
+        session_id = generate_short_id().encode()
+
+    if args.mode == "connect":
+        sys.stderr.write(f"Session ID: {session_id.decode()}\n")
+
     # Configure MQTT client
     userdata = {
         "subscribe_topic": subscribe_topic,
@@ -152,6 +174,7 @@ def main():
         "handshake_complete": not args.handshake,  # Start as complete if no handshake needed
         "waiting_for_ack": False,
         "expect_hello": args.mode == "listen" and args.handshake,
+        "session_id": session_id,
     }
 
     client = mqtt.Client(userdata=userdata)
@@ -217,14 +240,17 @@ def main():
         userdata["waiting_for_ack"] = True
         start_time = time.time()
         last_hello_time = 0
+        hello_msg = HELLO_PREFIX + session_id
 
         while running and not userdata["handshake_complete"]:
             current_time = time.time()
             # Send hello at intervals
             if current_time - last_hello_time > args.hello_interval:
-                client.publish(publish_topic, HELLO_MESSAGE, qos=args.qos)
+                client.publish(publish_topic, hello_msg, qos=args.qos)
                 last_hello_time = current_time
-                sys.stderr.write("Sent hello. Waiting for acknowledgment...\n")
+                sys.stderr.write(
+                    f"Sent hello (ID: {session_id.decode()}). Waiting for acknowledgment...\n"
+                )
 
             # Check timeout
             if current_time - start_time > args.hello_timeout:
