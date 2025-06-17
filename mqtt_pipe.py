@@ -35,6 +35,7 @@ def on_message(client, userdata, msg):
 
 
 def on_disconnect(client, userdata, rc):
+    userdata["disconnected"] = rc
     if rc != 0:
         sys.stderr.write(f"Unexpected disconnect (rc: {rc})\n")
 
@@ -66,7 +67,8 @@ def main():
 
     # Configure MQTT client
     keepalive = profile.get("keepalive", 60)
-    client = mqtt.Client(userdata={"subscribe_topic": subscribe_topic})
+    userdata = {"subscribe_topic": subscribe_topic, "disconnected": None}
+    client = mqtt.Client(userdata=userdata)
     client.on_connect = on_connect
     client.on_message = on_message
     client.on_disconnect = on_disconnect
@@ -126,6 +128,11 @@ def main():
     # Read from stdin using non-blocking I/O
     try:
         while running:
+            # Check if we got an unexpected disconnect
+            if userdata["disconnected"] is not None and userdata["disconnected"] != 0:
+                sys.stderr.write("Disconnected from broker, exiting.\n")
+                break
+
             # Check if there's data available to read
             rlist, _, _ = select.select([sys.stdin], [], [], 0.1)
 
