@@ -5,6 +5,7 @@ import select
 import signal
 import ssl
 import sys
+import time
 
 import paho.mqtt.client as mqtt
 
@@ -12,6 +13,8 @@ import paho.mqtt.client as mqtt
 DEFAULT_CHUNK_SIZE = 1024 * 64
 DEFAULT_QOS = 0
 DEFAULT_KEEPALIVE = 60
+DEFAULT_MAX_PENDING = 10  # Maximum in-flight messages for throttling
+DEFAULT_QOS0_DELAY_MS = 1  # 1ms default delay for QoS 0
 
 
 def load_profiles(filename):
@@ -51,6 +54,12 @@ def on_disconnect(client, userdata, rc):
         sys.stderr.write(f"{message}\n")
 
 
+# New callback for message acknowledgments
+def on_publish(client, userdata, mid):
+    """Called when a message is acknowledged by the broker"""
+    userdata["pending_count"] -= 1
+
+
 def main():
     parser = argparse.ArgumentParser(description="MQTT Netcat-like Tool")
     parser.add_argument(
@@ -80,6 +89,18 @@ def main():
         default=DEFAULT_CHUNK_SIZE,
         help=f"Chunk size for reading stdin (bytes, default: {DEFAULT_CHUNK_SIZE})",
     )
+    parser.add_argument(
+        "--max-pending",
+        type=int,
+        default=DEFAULT_MAX_PENDING,
+        help=f"Max pending acknowledgments before throttling (default: {DEFAULT_MAX_PENDING})",
+    )
+    parser.add_argument(
+        "--qos0-delay",
+        type=float,
+        default=DEFAULT_QOS0_DELAY_MS,
+        help=f"Delay between QoS 0 sends in milliseconds (default: {DEFAULT_QOS0_DELAY_MS} ms)",
+    )
 
     args = parser.parse_args()
 
@@ -88,6 +109,23 @@ def main():
         sys.stderr.write("Warning: Small chunk sizes (<256B) may reduce performance\n")
     elif args.chunk_size > 1024 * 1024:
         sys.stderr.write("Warning: Large chunk sizes (>1MB) may cause buffer issues\n")
+
+    # Validate max pending
+    if args.max_pending < 1:
+        sys.stderr.write("Max pending must be at least 1\n")
+        sys.exit(1)
+
+    # Convert milliseconds to seconds for internal use
+    qos0_delay_seconds = args.qos0_delay / 1000.0
+
+    # Validate QoS 0 delay
+    if args.qos0_delay < 0:
+        sys.stderr.write("QoS 0 delay must be non-negative\n")
+        sys.exit(1)
+    elif args.qos0_delay == 0:
+        sys.stderr.write("Warning: Zero QoS 0 delay may overwhelm broker/receiver\n")
+    elif args.qos0_delay > 100:  # 100ms
+        sys.stderr.write("Warning: Large QoS 0 delay (>100ms) may reduce throughput\n")
 
     # Set topics based on mode
     if args.mode == "listen":
@@ -105,11 +143,19 @@ def main():
         sys.exit(1)
 
     # Configure MQTT client with clean session
-    userdata = {"subscribe_topic": subscribe_topic, "disconnected": None, "qos": args.qos}
+    userdata = {
+        "subscribe_topic": subscribe_topic,
+        "disconnected": None,
+        "qos": args.qos,
+        "pending_count": 0,  # Track unacknowledged messages
+        "max_pending": args.max_pending,  # Max allowed in-flight messages
+        "current_chunk": None,  # For storing unsent data during throttling
+    }
     client = mqtt.Client(clean_session=True, userdata=userdata)
     client.on_connect = on_connect
     client.on_message = on_message
     client.on_disconnect = on_disconnect
+    client.on_publish = on_publish  # For tracking message acknowledgments
 
     # Set credentials if available
     if "username" in profile and "password" in profile:
@@ -169,7 +215,11 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    # Read from stdin using non-blocking I/O
+    # Throttling variables
+    qos0_delay = qos0_delay_seconds  # Use user-specified delay in seconds
+    last_send_time = 0
+
+    # Read from stdin using non-blocking I/O with throttling
     try:
         while running:
             # Check if we got an unexpected disconnect
@@ -180,20 +230,53 @@ def main():
                 else:  # Normal disconnect
                     break
 
+            # Throttling logic
+            credit_available = True
+            if userdata["qos"] > 0:
+                # For QoS 1/2: Check pending acknowledgments
+                if userdata["pending_count"] >= userdata["max_pending"]:
+                    credit_available = False
+            else:
+                # For QoS 0: Rate limit sends using specified delay
+                current_time = time.monotonic()
+                if current_time - last_send_time < qos0_delay:
+                    credit_available = False
+                else:
+                    last_send_time = current_time
+
             # Check if there's data available to read
             rlist, _, _ = select.select([sys.stdin], [], [], 0.1)
 
-            if rlist:
+            if rlist and credit_available:
                 data = sys.stdin.buffer.read1(args.chunk_size)
                 if not data:  # EOF
                     break
                 result = client.publish(publish_topic, data, qos=args.qos)
 
-                # Handle publisher backpressure
-                if result.rc != mqtt.MQTT_ERR_SUCCESS:
-                    sys.stderr.write(f"Publish queue full! Discarding chunk (rc: {result.rc})\n")
-                    # Instead of exiting, we skip this chunk to prevent blocking
-                    # Continue processing to allow queue to drain
+                # Track pending messages for QoS 1/2
+                if result.rc == mqtt.MQTT_ERR_SUCCESS:
+                    if args.qos > 0:
+                        userdata["pending_count"] += 1
+                else:
+                    sys.stderr.write(f"Publish failed (rc: {result.rc}), retrying...\n")
+                    # Store unsent data for retry
+                    userdata["current_chunk"] = data
+
+            # Retry sending any failed chunks when credit available
+            elif userdata["current_chunk"] and credit_available:
+                data = userdata["current_chunk"]
+                result = client.publish(publish_topic, data, qos=args.qos)
+                if result.rc == mqtt.MQTT_ERR_SUCCESS:
+                    if args.qos > 0:
+                        userdata["pending_count"] += 1
+                    userdata["current_chunk"] = None  # Clear stored chunk
+                else:
+                    sys.stderr.write(f"Retry failed (rc: {result.rc}), will retry...\n")
+
+            # Brief pause to prevent busy-waiting
+            elif not credit_available:
+                time.sleep(min(0.01, qos0_delay))  # Sleep proportional to delay setting
+
     except BrokenPipeError:
         pass
     except KeyboardInterrupt:
