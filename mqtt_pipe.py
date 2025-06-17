@@ -41,7 +41,14 @@ def on_message(client, userdata, msg):
 def on_disconnect(client, userdata, rc):
     userdata["disconnected"] = rc
     if rc != 0:
-        sys.stderr.write(f"Unexpected disconnect (rc: {rc})\n")
+        # Map common disconnect reasons to human-readable messages
+        disconnect_messages = {
+            mqtt.MQTT_ERR_CONN_LOST: "Broker connection lost",
+            mqtt.MQTT_ERR_CONN_REFUSED: "Connection refused",
+            mqtt.MQTT_ERR_NO_CONN: "No connection available",
+        }
+        message = disconnect_messages.get(rc, f"Unexpected disconnect (rc: {rc})")
+        sys.stderr.write(f"{message}\n")
 
 
 def main():
@@ -76,10 +83,11 @@ def main():
 
     args = parser.parse_args()
 
-    # Validate chunk size
-    if args.chunk_size <= 0:
-        sys.stderr.write("Chunk size must be a positive integer\n")
-        sys.exit(1)
+    # Validate and warn about chunk size
+    if args.chunk_size < 256:
+        sys.stderr.write("Warning: Small chunk sizes (<256B) may reduce performance\n")
+    elif args.chunk_size > 1024 * 1024:
+        sys.stderr.write("Warning: Large chunk sizes (>1MB) may cause buffer issues\n")
 
     # Set topics based on mode
     if args.mode == "listen":
@@ -96,10 +104,9 @@ def main():
         sys.stderr.write(f"Profile '{args.profile_name}' not found\n")
         sys.exit(1)
 
-    # Configure MQTT client
-
+    # Configure MQTT client with clean session
     userdata = {"subscribe_topic": subscribe_topic, "disconnected": None, "qos": args.qos}
-    client = mqtt.Client(userdata=userdata)
+    client = mqtt.Client(clean_session=True, userdata=userdata)
     client.on_connect = on_connect
     client.on_message = on_message
     client.on_disconnect = on_disconnect
@@ -132,9 +139,15 @@ def main():
             sys.stderr.write(f"TLS setup error: {str(e)}\n")
             sys.exit(1)
 
-    # Connect to broker
+    # Connect to broker with improved error handling
     try:
         client.connect(profile["host"], int(profile["port"]), args.keepalive)
+    except ConnectionRefusedError:
+        sys.stderr.write("Connection refused. Check broker availability and port.\n")
+        sys.exit(1)
+    except ssl.SSLError as e:
+        sys.stderr.write(f"TLS handshake failed: {str(e)}\n")
+        sys.exit(1)
     except Exception as e:
         sys.stderr.write(f"Connection error: {str(e)}\n")
         sys.exit(1)
@@ -160,18 +173,27 @@ def main():
     try:
         while running:
             # Check if we got an unexpected disconnect
-            if userdata["disconnected"] is not None and userdata["disconnected"] != 0:
-                sys.stderr.write("Disconnected from broker, exiting.\n")
-                break
+            if userdata["disconnected"] is not None:
+                if userdata["disconnected"] != 0:
+                    sys.stderr.write("Disconnected from broker, exiting.\n")
+                    break
+                else:  # Normal disconnect
+                    break
 
             # Check if there's data available to read
             rlist, _, _ = select.select([sys.stdin], [], [], 0.1)
 
             if rlist:
-                data = sys.stdin.buffer.read1(args.chunk_size)  # Use read1 for partial reads
+                data = sys.stdin.buffer.read1(args.chunk_size)
                 if not data:  # EOF
                     break
                 result = client.publish(publish_topic, data, qos=args.qos)
+
+                # Handle publisher backpressure
+                if result.rc != mqtt.MQTT_ERR_SUCCESS:
+                    sys.stderr.write(f"Publish queue full! Discarding chunk (rc: {result.rc})\n")
+                    # Instead of exiting, we skip this chunk to prevent blocking
+                    # Continue processing to allow queue to drain
     except BrokenPipeError:
         pass
     except KeyboardInterrupt:
