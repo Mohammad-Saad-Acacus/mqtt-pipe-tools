@@ -9,7 +9,10 @@ import threading
 
 import paho.mqtt.client as mqtt
 
-CHUNK_SIZE = 1024 * 64
+# Default values
+DEFAULT_CHUNK_SIZE = 1024 * 64
+DEFAULT_QOS = 0
+DEFAULT_KEEPALIVE = 60
 
 
 def load_profiles(filename):
@@ -23,8 +26,10 @@ def load_profiles(filename):
 
 def on_connect(client, userdata, flags, rc):
     if rc == 0:
-        client.subscribe(userdata["subscribe_topic"], qos=0)
-        sys.stderr.write(f"Connected to broker, subscribed to {userdata['subscribe_topic']}\n")
+        client.subscribe(userdata["subscribe_topic"], qos=userdata["qos"])
+        sys.stderr.write(
+            f"Connected to broker, subscribed to {userdata['subscribe_topic']} (QoS: {userdata['qos']})\n"
+        )
     else:
         sys.stderr.write(f"Connection failed with code {rc}\n")
 
@@ -48,7 +53,34 @@ def main():
     parser.add_argument("prefix", help="Topic prefix for communication")
     parser.add_argument("profiles_file", help="JSON file containing MQTT profiles")
     parser.add_argument("profile_name", help="Profile name to use from profiles file")
+
+    # Performance parameters
+    parser.add_argument(
+        "--qos",
+        type=int,
+        choices=[0, 1, 2],
+        default=DEFAULT_QOS,
+        help=f"Quality of Service level (default: {DEFAULT_QOS})",
+    )
+    parser.add_argument(
+        "--keepalive",
+        type=int,
+        default=DEFAULT_KEEPALIVE,
+        help=f"Keepalive interval in seconds (default: {DEFAULT_KEEPALIVE})",
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=DEFAULT_CHUNK_SIZE,
+        help=f"Chunk size for reading stdin (bytes, default: {DEFAULT_CHUNK_SIZE})",
+    )
+
     args = parser.parse_args()
+
+    # Validate chunk size
+    if args.chunk_size <= 0:
+        sys.stderr.write("Chunk size must be a positive integer\n")
+        sys.exit(1)
 
     # Set topics based on mode
     if args.mode == "listen":
@@ -66,8 +98,8 @@ def main():
         sys.exit(1)
 
     # Configure MQTT client
-    keepalive = profile.get("keepalive", 60)
-    userdata = {"subscribe_topic": subscribe_topic, "disconnected": None}
+
+    userdata = {"subscribe_topic": subscribe_topic, "disconnected": None, "qos": args.qos}
     client = mqtt.Client(userdata=userdata)
     client.on_connect = on_connect
     client.on_message = on_message
@@ -103,7 +135,7 @@ def main():
 
     # Connect to broker
     try:
-        client.connect(profile["host"], int(profile["port"]), keepalive)
+        client.connect(profile["host"], int(profile["port"]), args.keepalive)
     except Exception as e:
         sys.stderr.write(f"Connection error: {str(e)}\n")
         sys.exit(1)
@@ -137,10 +169,10 @@ def main():
             rlist, _, _ = select.select([sys.stdin], [], [], 0.1)
 
             if rlist:
-                data = sys.stdin.buffer.read1(CHUNK_SIZE)  # Use read1 for partial reads
+                data = sys.stdin.buffer.read1(args.chunk_size)  # Use read1 for partial reads
                 if not data:  # EOF
                     break
-                result = client.publish(publish_topic, data, qos=0)
+                result = client.publish(publish_topic, data, qos=args.qos)
     except BrokenPipeError:
         pass
     except KeyboardInterrupt:
