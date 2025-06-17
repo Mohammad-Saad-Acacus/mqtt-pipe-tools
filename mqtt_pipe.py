@@ -6,6 +6,7 @@ import signal
 import ssl
 import sys
 import threading
+import time
 
 import paho.mqtt.client as mqtt
 
@@ -13,6 +14,9 @@ import paho.mqtt.client as mqtt
 DEFAULT_CHUNK_SIZE = 1024 * 64
 DEFAULT_QOS = 0
 DEFAULT_KEEPALIVE = 60
+DEFAULT_HANDSHAKE_TIMEOUT = 5
+HELLO_MESSAGE = b"HELLO"
+HELLO_ACK_MESSAGE = b"HELLO_ACK"
 
 
 def load_profiles(filename):
@@ -35,6 +39,27 @@ def on_connect(client, userdata, flags, rc):
 
 
 def on_message(client, userdata, msg):
+    # If we're waiting for a handshake acknowledgment
+    if userdata.get("waiting_for_ack"):
+        if msg.payload == HELLO_ACK_MESSAGE:
+            userdata["handshake_complete"] = True
+            userdata["waiting_for_ack"] = False
+            sys.stderr.write("Handshake acknowledged. Starting data transfer.\n")
+        return
+
+    # If we're in listen mode and receive a hello message
+    if (
+        userdata["mode"] == "listen"
+        and userdata.get("expect_hello")
+        and msg.payload == HELLO_MESSAGE
+    ):
+        if userdata["handshake"]:
+            client.publish(userdata["publish_topic"], HELLO_ACK_MESSAGE, qos=userdata["qos"])
+            userdata["expect_hello"] = False
+            sys.stderr.write("Handshake received. Acknowledging and starting data transfer.\n")
+        return
+
+    # Normal data message
     sys.stdout.buffer.write(msg.payload)
     sys.stdout.buffer.flush()
 
@@ -75,6 +100,25 @@ def main():
         help=f"Chunk size for reading stdin (bytes, default: {DEFAULT_CHUNK_SIZE})",
     )
 
+    # Handshake parameters
+    parser.add_argument(
+        "--handshake",
+        action="store_true",
+        help="Enable handshake mechanism to verify listener presence",
+    )
+    parser.add_argument(
+        "--hello-timeout",
+        type=int,
+        default=DEFAULT_HANDSHAKE_TIMEOUT,
+        help=f"Timeout for handshake acknowledgment in seconds (default: {DEFAULT_HANDSHAKE_TIMEOUT})",
+    )
+    parser.add_argument(
+        "--hello-interval",
+        type=int,
+        default=1,
+        help="Interval between hello retries in seconds (default: 1)",
+    )
+
     args = parser.parse_args()
 
     # Validate chunk size
@@ -98,8 +142,18 @@ def main():
         sys.exit(1)
 
     # Configure MQTT client
+    userdata = {
+        "subscribe_topic": subscribe_topic,
+        "publish_topic": publish_topic,
+        "disconnected": None,
+        "qos": args.qos,
+        "mode": args.mode,
+        "handshake": args.handshake,
+        "handshake_complete": not args.handshake,  # Start as complete if no handshake needed
+        "waiting_for_ack": False,
+        "expect_hello": args.mode == "listen" and args.handshake,
+    }
 
-    userdata = {"subscribe_topic": subscribe_topic, "disconnected": None, "qos": args.qos}
     client = mqtt.Client(userdata=userdata)
     client.on_connect = on_connect
     client.on_message = on_message
@@ -156,6 +210,32 @@ def main():
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
+
+    # For connect mode with handshake: send hello and wait for acknowledgment
+    if args.mode == "connect" and args.handshake:
+        sys.stderr.write("Sending handshake hello...\n")
+        userdata["waiting_for_ack"] = True
+        start_time = time.time()
+        last_hello_time = 0
+
+        while running and not userdata["handshake_complete"]:
+            current_time = time.time()
+            # Send hello at intervals
+            if current_time - last_hello_time > args.hello_interval:
+                client.publish(publish_topic, HELLO_MESSAGE, qos=args.qos)
+                last_hello_time = current_time
+                sys.stderr.write("Sent hello. Waiting for acknowledgment...\n")
+
+            # Check timeout
+            if current_time - start_time > args.hello_timeout:
+                sys.stderr.write("Handshake timeout. No listener detected.\n")
+                running = False
+                break
+
+            time.sleep(0.1)
+
+        if not running:
+            sys.exit(1)
 
     # Read from stdin using non-blocking I/O
     try:
