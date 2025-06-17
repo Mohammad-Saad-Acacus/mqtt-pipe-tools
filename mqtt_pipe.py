@@ -115,8 +115,8 @@ def validate_arguments(args):
 def get_topics(mode, prefix):
     """Determine publish/subscribe topics based on operation mode"""
     if mode == "listen":
-        return {"subscribe": f"{prefix}/connect", "publish": f"{prefix}/listen"}
-    return {"subscribe": f"{prefix}/listen", "publish": f"{prefix}/connect"}
+        return {"subscribe": f"{prefix}/listen", "publish": f"{prefix}/connect"}
+    return {"subscribe": f"{prefix}/connect", "publish": f"{prefix}/listen"}
 
 
 def configure_tls(client, profile):
