@@ -224,16 +224,28 @@ def setup_mqtt_client(profile, args, topics, qos0_delay_seconds):
 def main_loop(client, userdata, chunk_size):
     """Main processing loop with throttling and I/O handling"""
     running = True
+    immediate_shutdown = False
     last_send_time = 0
 
     # Signal handler for graceful shutdown
     def signal_handler(sig, frame):
         nonlocal running
-        sys.stderr.write("\nDisconnecting...\n")
-        running = False
-        client.disconnect()
-        client.loop_stop()
-        sys.exit(0)
+        nonlocal immediate_shutdown
+        if running:
+            # First Ctrl+C - initiate graceful shutdown
+            sys.stderr.write("\nShutting down...\n")
+            running = False
+        elif not immediate_shutdown:
+            # Second Ctrl+C - force exit without sending remaining data
+            immediate_shutdown = True
+            sys.stderr.write("\nForce shutdown requested. Disconnecting client...\n")
+            client.disconnect()
+            client.loop_stop()
+            sys.exit(1)
+        else:
+            # Third Ctrl+C - force exit without closing mqtt client
+            sys.stderr.write("\nForce IMMEDIATE shutdown requested. Exiting.\n")
+            sys.exit(1)
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
